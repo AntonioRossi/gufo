@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "name": "deepseek_v41_flash",
+  "target": "gufo_deepseek_v41_flash",
+  "kind": "static",
+  "purpose": "DeepSeek V4.1 Flash host code: chat template, sampling, GGUF probe, and extension registration.",
+  "consumers": [],
+  "checks": ["ds41_chat_template_test"]
+}

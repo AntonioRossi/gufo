@@ -8,6 +8,7 @@ are downloaded separately and are not part of the runtime package.
 | Model | Weights / supported inputs | Guide |
 | --- | --- | --- |
 | DeepSeek V4 Flash | Flash 0731 mixed IQ2/Q2/Q8 GGUF; text | [Usage and modes](deepseek-v4-flash/README.md) |
+| DeepSeek V4.1 Flash | Flash 1017 ISTA GSQ-RCO IQ1_M GGUF; text; one serial session | [Usage](deepseek-v4.1-flash/README.md) |
 | EmbeddingGemma 2 | BF16 safetensors; text/image to embeddings | [Usage](embeddinggemma-2/README.md) |
 | MiniMax H3 FL2VA | Pinned safetensors; text to audiovisual output | [Presets and usage](minimax-h3/README.md) |
 | Qwen-Image-2.1 | BF16 safetensors; generation and image editing | [Usage](qwen-image-2.1/README.md) |

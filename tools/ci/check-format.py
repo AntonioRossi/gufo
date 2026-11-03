@@ -13,6 +13,8 @@ def main() -> int:
     root = Path(__file__).resolve().parents[2]
     # BEGIN GENERATED VENDORED PATHS
     excluded = (
+        "src/models/deepseek_v41_flash/kernels/rocm/",
+        "src/models/deepseek_v41_flash/runtime/",
         "src/models/deepseek_v4_flash/kernels/rocm/",
         "src/models/deepseek_v4_flash/runtime/",
         "src/models/qwen38_flash_next/kernels/rocm/mmq/",

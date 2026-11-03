@@ -1,0 +1,48 @@
+{
+  "schema": 1,
+  "name": "deepseek_v41_flash",
+  "version": "0.1.0",
+  "api_version": ">= 0.1.17",
+  "entry": "deepseek_v41_flash_register",
+  "registration_target": "gufo_deepseek_v41_flash",
+  "depends": [],
+  "platforms": ["linux"],
+  "providers": [
+    {
+      "id": "deepseek41",
+      "capability": "text_generation",
+      "keys": ["gguf:deepseek41"],
+      "model_ids": ["deepseek41"],
+      "target": "gufo_deepseek_v41_flash_hip",
+      "entry": "deepseek_v41_flash_provider_register"
+    }
+  ],
+  "options": [],
+  "targets": {
+    "gufo_deepseek_v41_flash": {"requires": []},
+    "gufo_deepseek_v41_flash_hip": {"requires": ["hip"]}
+  },
+  "licenses": ["src/models/deepseek_v41_flash/LICENSE.ds4"],
+  "production_paths": {
+    "include": ["**/*.cpp", "**/*.h", "**/*.hpp", "**/*.hip", "extension.*"],
+    "exclude": ["tests/", "functional/", "tools/", "fixtures/"]
+  },
+  "vendored_paths": [
+    "src/models/deepseek_v41_flash/runtime/",
+    "src/models/deepseek_v41_flash/kernels/rocm/"
+  ],
+  "docs": {
+    "title": "DeepSeek V4.1 Flash",
+    "inputs": "Flash 1017 ISTA GSQ-RCO IQ1_M GGUF; text; one serial session",
+    "guide": "docs/models/deepseek-v4.1-flash/README.md"
+  },
+  "tests": [
+    {
+      "target": "ds41_chat_template_test",
+      "ctest": "ds41\\.template",
+      "check_pr": true
+    }
+  ],
+  "test_labels": ["ds41"],
+  "fixtures": "tests/models/deepseek_v41_flash/fixtures/"
+}

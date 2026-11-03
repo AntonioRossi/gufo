@@ -893,6 +893,9 @@ endfunction()
   endif()
 
   add_subdirectory(tests/models/deepseek_v4_flash)
+  if(TARGET gufo_deepseek_v41_flash)
+    add_subdirectory(tests/models/deepseek_v41_flash)
+  endif()
   add_subdirectory(tests/models/qwen38_flash_next)
 
   if(ENGINE_ENABLE_HIP)

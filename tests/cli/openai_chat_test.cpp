@@ -1692,6 +1692,21 @@ void TestModelSamplingDefaults() {
   config = send("");
   Expect(config.constraint == backend.defaults.sampling.constraint,
          "Explicit public-API configuration preserves its output constraint");
+  backend.defaults.model = TextModelPreset::kDeepSeekV41Flash;
+  backend.defaults.supplied = {};
+  for (const bool thinking : {false, true}) {
+    backend.reasoning_defaults_value.enabled = thinking;
+    config = send("");
+    Expect(config.temperature == 1.0F && config.top_p == 1.0F &&
+               config.top_k == 0 && config.min_p == 0.0F &&
+               config.presence_penalty == 0.0F &&
+               config.frequency_penalty == 0.0F &&
+               config.repeat_penalty == 1.0F,
+           "DeepSeek agentic defaults do not depend on reasoning");
+  }
+  config = send(R"(,"temperature":0.4,"top_p":0.7)");
+  Expect(config.temperature == 0.4F && config.top_p == 0.7F,
+         "Explicit request sampling overrides DeepSeek V4.1 defaults");
 }
 
 void TestCompleteToolDefinitionsReachTemplate() {
