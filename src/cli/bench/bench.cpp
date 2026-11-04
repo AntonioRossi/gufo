@@ -62,6 +62,14 @@ void RegisterBenchOptions(ArgParser& parser, BenchOptions& opt,
                    "Path to GGUF model file (required)", "Model",
                    &opt.model_path);
 
+  parser.AddFlag("", "--stream-experts",
+                 "DeepSeek V4.1 Flash: stream routed experts from SSD", "Model",
+                 &opt.stream_experts);
+  parser.AddOption("", "--expert-cache-bytes", "N",
+                   "Expert cache byte limit; requires --stream-experts "
+                   "(default: 0 = automatic)",
+                   "Model", &opt.expert_cache_bytes);
+
   parser.AddCustomOption(
       "-p", "--n-prompt", "n,n,...",
       "Prompt token lengths to benchmark (default: 2048)", "Workload",
@@ -242,6 +250,12 @@ std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
     return std::nullopt;
   }
 
+  if (opt.expert_cache_bytes != 0 && !opt.stream_experts) {
+    if (error_msg)
+      *error_msg = "--expert-cache-bytes requires --stream-experts";
+    return std::nullopt;
+  }
+
   if (opt.draft_tokens == 0 || opt.min_draft_tokens == 0 ||
       opt.min_draft_tokens > opt.draft_tokens) {
     if (error_msg != nullptr) {
@@ -320,6 +334,12 @@ int RunBench(std::span<const char* const> args) {
   if (provider == nullptr || provider->bench_driver == nullptr) {
     std::cerr << "Error: unsupported model architecture for benchmark\n";
     PrintModelLoadTime(model_load_start, false);
+    return 1;
+  }
+  if ((opt.stream_experts || opt.expert_cache_bytes != 0) &&
+      !provider->supports_expert_streaming) {
+    std::cerr << "Error: this benchmark provider does not support "
+                 "--stream-experts or --expert-cache-bytes\n";
     return 1;
   }
   return provider->bench_driver(opt, reader, model_load_start);

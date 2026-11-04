@@ -40,6 +40,16 @@ Explicit sampling values override the preset. See `ResolveTextSampling`
 in the [source sampling defaults](https://github.com/franzmoca/gufo/blob/01fb6f4e39464003efffd97d79607005146280f0/src/core/text_sampling_defaults.hpp).
 These code defaults do not approve a launch configuration.
 
+`gufo bench` supports one session, depth zero, and greedy ordinary decoding.
+It forwards `--stream-experts` and `--expert-cache-bytes` to the runtime.
+The benchmark keeps its greedy defaults; it does not use the serving preset
+or a chat template. At depth zero, `tg128` starts after a 16-token prefix.
+The `pp2048` and `tg128` tests use separate sessions in one process.
+For these workloads, context is 4096 and the default prefill batch is 2048.
+Every repetition is measured. Output gives the mean and sample standard
+deviation. This path rejects nonzero depth, concurrent sessions, sampled or
+speculative decoding, `--validate-prefill`, and `--enable-yarn`.
+
 This port does not claim conformance. The selected checks without model
 files are `ds41.template`, `qwen38_flash_next.prompt_lookup`,
 `ds41.mmq_typed`, `ds41.attention`, `ds41.hc_state_pass`, and

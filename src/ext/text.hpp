@@ -600,6 +600,8 @@ struct TextBenchOptions {
   }()};
   bool enable_yarn{false};
   bool verbose{false};
+  bool stream_experts{false};
+  std::uint64_t expert_cache_bytes{0};
 };
 
 struct TextPromptOptions {

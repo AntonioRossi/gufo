@@ -43,6 +43,18 @@ The source V4.1 cases in `TestModelSamplingDefaults` are also imported from
 [openai_chat_test.cpp](https://github.com/franzmoca/gufo/blob/01fb6f4e39464003efffd97d79607005146280f0/tests/cli/openai_chat_test.cpp).
 The CLI context stays at 4096 tokens through `kDefaultContext`.
 
+`bench.cpp` adapts the single-session, depth-zero, greedy path of
+`RunDeepSeekBenchmark` from the pinned source
+[benchmark command](https://github.com/franzmoca/gufo/blob/01fb6f4e39464003efffd97d79607005146280f0/src/cli/bench/bench.cpp).
+It preserves the source token pattern, timing boundaries, repetition order,
+and mean with sample standard deviation. Decode starts from 16 tokens at
+depth zero. The model and expert store remain alive across repetitions.
+The benchmark does not call `FitExpertCache`, as in the source benchmark.
+It reports the existing `ExpertCacheStatus` outside the measured intervals.
+`TextBenchOptions` forwards the streaming flag and cache cap. Sampled
+decoding, nonzero depth, concurrency, and prefill validation are not exposed
+by this first benchmark path. Prompt, chat, and HTTP paths are unchanged.
+
 The host target contains the chat template, sampling, probe, and registration.
 The HIP target contains the engine, runtime, adapter, and non-MMQ kernels.
 The MMQ target keeps its source compiler settings and generated type objects.
@@ -88,6 +100,7 @@ from it. The V4 engine itself stays unchanged.
 - `runner.cpp` connects ordinary generation to the current text interface.
 - `drivers.cpp` connects the prompt and chat commands to that runner. Each
   chat turn creates a new session.
+- `bench.cpp` connects the selected source benchmark path to `gufo bench`.
 
 DeepSeek kernels are private to this package: a change here must not alter
 another model's output or performance.

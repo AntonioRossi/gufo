@@ -81,6 +81,7 @@ gufo_extension_target(
     runtime/v41_session.cpp
     runner.cpp
     drivers.cpp
+    bench.cpp
     provider.cpp
   LINK_LIBRARIES
     gufo_deepseek_v41_flash
