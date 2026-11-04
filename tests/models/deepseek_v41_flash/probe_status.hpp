@@ -21,15 +21,22 @@ public:
   explicit ProbeStages(bool tokenization_selected = false)
       : tokenization_selected_(tokenization_selected) {}
 
-  // A stage remains unknown until all its work is complete. A supplied
-  // reason fails the stage. Stages with unmet dependencies remain blocked.
-  // Return 1 for a failure or an unmet dependency; otherwise return 0.
+  // Completed results do not change. Unmet dependencies leave a stage blocked.
+  // Otherwise a supplied reason fails an incomplete stage. Progress remains
+  // unknown until all work is complete. Return 1 for a failure, an unmet
+  // dependency, or an invalid or absent stage; otherwise return 0.
   int Transition(Stage stage, std::uint64_t completed, std::uint64_t total,
                  const char* failure = nullptr) {
     if (failure)
       reason_ = failure;
     if (stage == Stage::kActive)
       stage = active_;
+    const auto index = static_cast<std::size_t>(stage);
+    if (index >= results_.size())
+      return 1;
+    auto& result = results_[index];
+    if (result == StageResult::kPass || result == StageResult::kFail)
+      return failure || result == StageResult::kFail ? 1 : 0;
     switch (stage) {
       case Stage::kLoading:
         break;
@@ -50,7 +57,6 @@ public:
       default:
         return 1;
     }
-    auto& result = results_[static_cast<std::size_t>(stage)];
     result = failure                            ? StageResult::kFail
              : total != 0 && completed == total ? StageResult::kPass
                                                 : StageResult::kUnknown;

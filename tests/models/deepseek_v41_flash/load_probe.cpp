@@ -905,6 +905,19 @@ int RunProbe(int argc, char** argv, ProbeStatus& status) {
   Report("start");
   const auto begin = std::chrono::steady_clock::now();
   ds41_engine* engine = nullptr;
+  ds41_decoder* decoder = nullptr;
+  auto transition = [&](Stage stage, std::uint64_t completed,
+                        std::uint64_t total, const char* failure = nullptr) {
+    const int result =
+        status.stages.Transition(stage, completed, total, failure);
+    if (result != 0) {
+      ds41_decoder_destroy(decoder);
+      decoder = nullptr;
+      ds41_engine_close(engine);
+      engine = nullptr;
+    }
+    return result;
+  };
   ds41_engine_options options{};
   options.model_path = model;
   options.validate_only = !upload;
@@ -919,12 +932,14 @@ int RunProbe(int argc, char** argv, ProbeStatus& status) {
   status.ordinary = decode && !replay_check && !spec_check && spec_bench < 0 &&
                     joint_check <= 0 && dspark_generate <= 0 && !dspark_dump;
   status.stages = ProbeStages(tokenize != nullptr);
-  status.stages.Transition(Stage::kLoading, 0, 1);
-  if (ds41_engine_open(&engine, &options) != 0) {
-    status.stages.Transition(Stage::kLoading, 0, 1, "engine_open_failed");
-    return 1;
-  }
-  status.stages.Transition(Stage::kLoading, 1, 1);
+  if (decode && !*decode)
+    return transition(Stage::kPrefill, 0, 0, "empty_decode_prompt");
+  if (const int result = transition(Stage::kLoading, 0, 1); result != 0)
+    return result;
+  if (ds41_engine_open(&engine, &options) != 0)
+    return transition(Stage::kLoading, 0, 1, "engine_open_failed");
+  if (const int result = transition(Stage::kLoading, 1, 1); result != 0)
+    return result;
   status.expert_cache = ds41_engine_expert_cache_status(engine);
   const double seconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - begin)
@@ -937,7 +952,8 @@ int RunProbe(int argc, char** argv, ProbeStatus& status) {
     /* One text per line; "\n" in a line stands for a newline. Prints the ids.
      */
     std::ifstream in(tokenize);
-    status.stages.Transition(Stage::kTokenization, 0, 1);
+    if (const int result = transition(Stage::kTokenization, 0, 1); result != 0)
+      return result;
     std::string line;
     while (std::getline(in, line)) {
       std::string text;
@@ -964,17 +980,15 @@ int RunProbe(int argc, char** argv, ProbeStatus& status) {
     }
     const bool tokenized =
         in.eof() && status.tokenized_lines > 0 && status.tokenized_tokens > 0;
-    const int result =
-        status.stages.Transition(Stage::kTokenization, tokenized ? 1 : 0, 1,
-                                 tokenized ? nullptr : "tokenization_failed");
-    if (result != 0) {
-      ds41_engine_close(engine);
+    if (const int result =
+            transition(Stage::kTokenization, tokenized ? 1 : 0, 1,
+                       tokenized ? nullptr : "tokenization_failed");
+        result != 0)
       return result;
-    }
   }
   if (decode && !status.ordinary) {
-    status.stages.Transition(Stage::kPrefill, 0, 1);
-    status.stages.Transition(Stage::kDecode, 0, 1);
+    if (const int result = transition(Stage::kPrefill, 0, 1); result != 0)
+      return result;
   }
   if (decode && replay_check) {
     std::vector<int> ids;
@@ -1020,14 +1034,13 @@ int RunProbe(int argc, char** argv, ProbeStatus& status) {
         ++p;
     }
     const uint32_t total = (uint32_t)tokens.size() + (uint32_t)generate;
-    status.stages.Transition(Stage::kPrefill, 0, tokens.size());
-    ds41_decoder* decoder =
-        ds41_decoder_create(engine, std::max(context, total + 1));
-    if (!decoder) {
-      status.stages.Transition(Stage::kPrefill, 0, tokens.size(),
-                               "decoder_create_failed");
-      return 1;
-    }
+    if (const int result = transition(Stage::kPrefill, 0, tokens.size());
+        result != 0)
+      return result;
+    decoder = ds41_decoder_create(engine, std::max(context, total + 1));
+    if (!decoder)
+      return transition(Stage::kPrefill, 0, tokens.size(),
+                        "decoder_create_failed");
     Report("decoder");
     Dump dump;
     if (out_dir) {
@@ -1048,11 +1061,9 @@ int RunProbe(int argc, char** argv, ProbeStatus& status) {
     const uint32_t cap = ds41_decoder_batch_capacity(decoder);
     std::vector<float> rows(batch ? static_cast<size_t>(cap) * vocab : 0);
     // The decoder and probe buffers exist before the source cache-fit step.
-    if (stream_experts && ds41_engine_fit_experts(engine, 0) != 0) {
-      status.stages.Transition(Stage::kPrefill, 0, tokens.size(),
-                               "expert_cache_fit_failed");
-      return 1;
-    }
+    if (stream_experts && ds41_engine_fit_experts(engine, 0) != 0)
+      return transition(Stage::kPrefill, 0, tokens.size(),
+                        "expert_cache_fit_failed");
     status.expert_cache = ds41_engine_expert_cache_status(engine);
     /* Records the logits of position `step` (input `token`). */
     auto consume = [&](uint32_t step, int token, const float* row, double ms) {
@@ -1090,9 +1101,8 @@ int RunProbe(int argc, char** argv, ProbeStatus& status) {
         if (ds41_decoder_eval(decoder, tokens.data() + step, n, rows.data(),
                               logit_rows, nullptr, nullptr) != 0) {
           std::fprintf(stderr, "batch failed at step %u\n", step);
-          status.stages.Transition(Stage::kPrefill, step, tokens.size(),
-                                   "prefill_failed");
-          return 1;
+          return transition(Stage::kPrefill, step, tokens.size(),
+                            "prefill_failed");
         }
         const double ms = std::chrono::duration<double, std::milli>(
                               std::chrono::steady_clock::now() - t0)
@@ -1103,14 +1113,19 @@ int RunProbe(int argc, char** argv, ProbeStatus& status) {
           consume(step + i, tokens[step + i],
                   rows.data() + (size_t)(i - (n - logit_rows)) * vocab, ms / n);
         step += n;
-        status.stages.Transition(Stage::kPrefill, step, tokens.size());
+        if (const int result = transition(Stage::kPrefill, step, tokens.size());
+            result != 0)
+          return result;
       }
     }
     for (; step < total; ++step) {
       const bool is_prompt = step < tokens.size();
-      if (!is_prompt)
-        status.stages.Transition(Stage::kDecode, step - tokens.size(),
-                                 generate);
+      if (!is_prompt) {
+        if (const int result =
+                transition(Stage::kDecode, step - tokens.size(), generate);
+            result != 0)
+          return result;
+      }
       const int token = step < tokens.size() ? tokens[step] : generated.back();
       dump.pos = step;
       const auto t0 = std::chrono::steady_clock::now();
@@ -1118,20 +1133,19 @@ int RunProbe(int argc, char** argv, ProbeStatus& status) {
                             out_dir && !score ? DumpLayer : nullptr,
                             &dump) != 0) {
         std::fprintf(stderr, "decode failed at step %u\n", step);
-        status.stages.Transition(
-            is_prompt ? Stage::kPrefill : Stage::kDecode, 0, 1,
-            is_prompt ? "prefill_failed" : "decode_failed");
-        return 1;
+        return transition(is_prompt ? Stage::kPrefill : Stage::kDecode, 0, 1,
+                          is_prompt ? "prefill_failed" : "decode_failed");
       }
       const double ms = std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - t0)
                             .count();
       consume(step, token, logits.data(), ms);
-      if (is_prompt)
-        status.stages.Transition(Stage::kPrefill, step + 1, tokens.size());
-      else
-        status.stages.Transition(Stage::kDecode, step + 1 - tokens.size(),
-                                 generate);
+      const int result =
+          is_prompt
+              ? transition(Stage::kPrefill, step + 1, tokens.size())
+              : transition(Stage::kDecode, step + 1 - tokens.size(), generate);
+      if (result != 0)
+        return result;
     }
     std::printf("generated");
     for (size_t i = 0;

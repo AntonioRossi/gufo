@@ -140,6 +140,64 @@ void TestDecodeFailure() {
   assert(std::strcmp(status.Reason(), "decode_failed") == 0);
 }
 
+void TestInvalidTransition() {
+  ProbeStages status;
+  assert(status.Transition(static_cast<Stage>(99), 1, 1) != 0);
+  for (const auto stage :
+       {Stage::kLoading, Stage::kTokenization, Stage::kPrefill, Stage::kDecode})
+    assert(status.Get(stage) == StageResult::kBlocked);
+  assert(std::strcmp(status.Reason(), "") == 0);
+}
+
+void TestNoActiveTransition(bool after_pass) {
+  ProbeStages status;
+  if (after_pass)
+    status.Transition(Stage::kLoading, 1, 1);
+  assert(status.Transition(Stage::kActive, 1, 1) != 0);
+  assert(status.Get(Stage::kLoading) ==
+         (after_pass ? StageResult::kPass : StageResult::kBlocked));
+  for (const auto stage :
+       {Stage::kTokenization, Stage::kPrefill, Stage::kDecode})
+    assert(status.Get(stage) == StageResult::kBlocked);
+  assert(std::strcmp(status.Reason(), "") == 0);
+}
+
+void TestFailureWithUnmetDependency() {
+  ProbeStages status;
+  status.Transition(Stage::kLoading, 1, 1);
+  status.Transition(Stage::kPrefill, 0, 2);
+  assert(status.Transition(Stage::kDecode, 0, 1, "decode_failed") != 0);
+  assert(status.Get(Stage::kPrefill) == StageResult::kUnknown);
+  assert(status.Get(Stage::kDecode) == StageResult::kBlocked);
+  assert(std::strcmp(status.Reason(), "decode_failed") == 0);
+}
+
+void TestCompletedResults() {
+  const Stage stages[] = {Stage::kLoading, Stage::kTokenization,
+                          Stage::kPrefill, Stage::kDecode};
+  for (const auto stage : stages) {
+    for (const bool failed : {false, true}) {
+      ProbeStages status(true);
+      for (const auto prerequisite : stages) {
+        if (prerequisite == stage)
+          break;
+        assert(status.Transition(prerequisite, 1, 1) == 0);
+      }
+      const int expected = failed ? 1 : 0;
+      const auto result = failed ? StageResult::kFail : StageResult::kPass;
+      assert(status.Transition(stage, 1, 1,
+                               failed ? "first_failure" : nullptr) == expected);
+      assert(status.Transition(stage, 0, 2) == expected);
+      assert(status.Get(stage) == result);
+      assert(status.Transition(stage, 1, 1) == expected);
+      assert(status.Get(stage) == result);
+      assert(status.Transition(stage, 0, 1, "later_failure") != 0);
+      assert(status.Get(stage) == result);
+      assert(std::strcmp(status.Reason(), "later_failure") == 0);
+    }
+  }
+}
+
 int main() {
   TestPromptCompletion(false);
   TestPromptCompletion(true);
@@ -152,6 +210,11 @@ int main() {
   TestDependencies();
   TestTokenizationFailure();
   TestDecodeFailure();
+  TestInvalidTransition();
+  TestNoActiveTransition(false);
+  TestNoActiveTransition(true);
+  TestFailureWithUnmetDependency();
+  TestCompletedResults();
   ProbeStages status;
   status.Transition(Stage::kLoading, 0, 1);
   status.Transition(Stage::kLoading, 0, 1, "engine_open_failed");
