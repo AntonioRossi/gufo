@@ -918,6 +918,7 @@ int RunProbe(int argc, char** argv, ProbeStatus& status) {
   status.requested_cache_bytes = expert_cache_bytes;
   status.ordinary = decode && !replay_check && !spec_check && spec_bench < 0 &&
                     joint_check <= 0 && dspark_generate <= 0 && !dspark_dump;
+  status.stages = ProbeStages(tokenize != nullptr);
   status.stages.Transition(Stage::kLoading, 0, 1);
   if (ds41_engine_open(&engine, &options) != 0) {
     status.stages.Transition(Stage::kLoading, 0, 1, "engine_open_failed");
@@ -963,8 +964,13 @@ int RunProbe(int argc, char** argv, ProbeStatus& status) {
     }
     const bool tokenized =
         in.eof() && status.tokenized_lines > 0 && status.tokenized_tokens > 0;
-    status.stages.Transition(Stage::kTokenization, tokenized ? 1 : 0, 1,
-                             tokenized ? nullptr : "tokenization_failed");
+    const int result =
+        status.stages.Transition(Stage::kTokenization, tokenized ? 1 : 0, 1,
+                                 tokenized ? nullptr : "tokenization_failed");
+    if (result != 0) {
+      ds41_engine_close(engine);
+      return result;
+    }
   }
   if (decode && !status.ordinary) {
     status.stages.Transition(Stage::kPrefill, 0, 1);
@@ -1154,7 +1160,7 @@ int main(int argc, char** argv) {
   try {
     result = RunProbe(argc, argv, status);
   } catch (const std::exception& error) {
-    status.stages.Transition(Stage::kActive, 0, 1, "probe_exception");
+    result = status.stages.Transition(Stage::kActive, 0, 1, "probe_exception");
     std::fprintf(stderr, "Probe failed: %s\n", error.what());
   }
   return status.Write(result) ? result : 1;
