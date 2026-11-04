@@ -23,7 +23,19 @@ positions must be present. The sixth position is the shared `IQ4_NL`
 Engram file under the matching shard-6 name. The bundle contains several
 expert types; `IQ1_M` is not the only type.
 
-The adapter rejects vision, tool calls, speculative decoding, and explicit
+The HTTP interface supports function tools, assistant tool-call history,
+and tool results. It uses the source V4.1 DSML grammar and scanner.
+Tool choice can be `auto`, `none`, `required`, or a declared function.
+The shared server retains namespaces and the parallel-call control.
+Responses preserve assistant text and reasoning. Calls with no assistant
+text use `content: null`. Completed calls use `finish_reason: "tool_calls"`;
+length limits and stop sequences keep their own finish reasons.
+Streaming responses send incremental tool arguments through the existing
+tool-delta path. Schema enforcement has the same strict and non-strict
+limits as the source grammar. The client executes the tools and returns
+their results; the model server does not execute them.
+
+The adapter rejects vision, speculative decoding, and explicit
 prompt-cache settings. It does not expose request batching.
 Prefix reuse, snapshots, and persistent prompt caching are
 unavailable. Each CLI chat turn creates a new session.
@@ -56,6 +68,9 @@ files are `ds41.template`, `qwen38_flash_next.prompt_lookup`,
 `ds41.candidate_mask`. The last four need a `gfx1151` HIP device.
 These checks do not establish model loading or HTTP generation.
 The CPU `ds41.probe_status` check covers the optional probe status component.
+The CPU `ds41.tool_calls` check covers request conversion, the scanner,
+and required-tool grammar. The shared HTTP and constraint tests include
+the source V4.1 cases, including incremental and interrupted calls.
 The probe writes one atomic status file with `--status-json`. It records
 the requested streaming values and the actual expert store separately.
 

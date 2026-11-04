@@ -9,6 +9,10 @@
 #include <string_view>
 #include <vector>
 
+namespace gufo::ext {
+struct ChatRequest;
+}
+
 namespace gufo::models::deepseek_v41_flash {
 
 struct ChatMessage {
@@ -55,6 +59,14 @@ struct ChatTemplateOptions {
   bool preserve_thinking{false};
   bool tools_present{false};
 };
+
+struct ChatInput {
+  std::vector<ChatMessage> messages;
+  std::vector<ChatTool> tools;
+  ChatTemplateOptions options;
+};
+
+[[nodiscard]] ChatInput ConvertChat(const ext::ChatRequest& request);
 
 /// User-facing defaults follow DeepSeek's API: thinking enabled, high effort.
 /// Explicit options override them; the checkpoint encoder itself has no

@@ -81,49 +81,12 @@ std::vector<TextRunnerToken> RunnerTokens(std::span<const int> tokens) {
   return result;
 }
 
-std::string RoleName(ext::ChatRole role) {
-  switch (role) {
-    case ext::ChatRole::kSystem:
-      return "system";
-    case ext::ChatRole::kDeveloper:
-      return "developer";
-    case ext::ChatRole::kUser:
-      return "user";
-    case ext::ChatRole::kAssistant:
-      return "assistant";
-    case ext::ChatRole::kTool:
-      throw std::invalid_argument(
-          "DeepSeek V4.1 tool messages are not supported");
-  }
-  throw std::invalid_argument("DeepSeek V4.1 chat role is invalid");
-}
-
-std::vector<ChatMessage> ConvertChat(const ext::ChatRequest& request) {
-  if (!request.tools.empty() || !request.forced_tool_name.empty() ||
-      !request.tool_namespaces.empty() || request.constrained_tools ||
-      request.tool_choice == ext::ChatRequest::ToolChoice::kRequired)
-    throw std::invalid_argument("DeepSeek V4.1 tool calls are not supported");
-  if (request.add_vision_id)
-    throw std::invalid_argument("DeepSeek V4.1 vision is not supported");
-  std::vector<ChatMessage> messages;
-  messages.reserve(request.messages.size());
-  for (const auto& message : request.messages) {
-    if (!message.images.empty())
-      throw std::invalid_argument("DeepSeek V4.1 image input is not supported");
-    if (!message.tool_calls.empty() || !message.tool_call_id.empty())
-      throw std::invalid_argument("DeepSeek V4.1 tool calls are not supported");
-    messages.push_back({.role = RoleName(message.role),
-                        .content = message.content + message.framing_suffix,
-                        .reasoning_content = message.thought,
-                        .tool_calls = {},
-                        .tool_call_id = {},
-                        .image_offsets = {}});
-  }
-  return messages;
-}
-
 class Runner final : public ext::HipTextModelRunner {
 public:
+  sampling::JsonConstraint::ToolFormat ToolFormat() const override {
+    return sampling::JsonConstraint::ToolFormat::kDeepSeek41;
+  }
+
   explicit Runner(std::shared_ptr<Model> model)
       : execution_(std::make_shared<Execution>()) {
     execution_->model = std::move(model);
@@ -174,9 +137,9 @@ public:
 
   std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
       const ext::ChatRequest& request) const override {
-    const auto messages = ConvertChat(request);
+    const auto input = ConvertChat(request);
     auto tokens = RunnerTokens(execution_->model->EncodeChat(
-        messages, ResolveDeepSeekChatOptions(request.reasoning)));
+        input.messages, input.tools, input.options));
     if (tokens.empty())
       return std::nullopt;
     return tokens;
@@ -184,8 +147,8 @@ public:
 
   std::optional<std::string> RenderPrompt(
       const ext::ChatRequest& request) const override {
-    return RenderChat(ConvertChat(request),
-                      ResolveDeepSeekChatOptions(request.reasoning));
+    const auto input = ConvertChat(request);
+    return RenderChat(input.messages, input.tools, input.options);
   }
 
   ext::InitialOutputState InitialOutputState(

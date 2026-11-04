@@ -1,3 +1,10 @@
+add_executable(ds41_tool_calls_test tool_calls_test.cpp)
+target_link_libraries(ds41_tool_calls_test PRIVATE gufo_deepseek_v41_flash)
+target_compile_definitions(ds41_tool_calls_test PRIVATE
+  GUFO_DS41_CHAT_GOLDENS="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/encoding-1017.json")
+add_test(NAME ds41.tool_calls COMMAND ds41_tool_calls_test)
+set_tests_properties(ds41.tool_calls PROPERTIES LABELS "cpu;ds41;tools")
+
 add_executable(ds41_chat_template_test
   chat_template_test.cpp
   ${PROJECT_SOURCE_DIR}/src/models/deepseek_v41_flash/chat_template.cpp)

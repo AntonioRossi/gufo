@@ -145,6 +145,10 @@ ToolMarkerSet ToolMarkers(
   // their native call syntax; keep recognizing every opener there.
   if (!format || *format == Format::kJson)
     return kToolMarkers;
+  if (*format == Format::kDeepSeek41) {
+    const auto* dialect = ext::FindToolDialect(*format);
+    return dialect ? ToolMarkerSet(dialect->markers) : ToolMarkerSet{};
+  }
   // Match the canonical opener selected by JsonConstraint::WithTools. Other
   // dialects are ordinary prose under that grammar, not additional calls.
   return *format == Format::kDeepSeek ? ToolMarkerSet(deepseek)
@@ -154,6 +158,10 @@ ToolMarkerSet ToolMarkers(
 // A native function header, rather than a bare marker mentioned in prose,
 // permits the implicit reasoning boundary used by llama.cpp's native parsers.
 ToolMarkerSet ReasoningToolMarkers(ToolMarkerSet markers) {
+  if (const auto* dialect = ext::FindToolDialect(
+          sampling::JsonConstraint::ToolFormat::kDeepSeek41);
+      dialect && std::ranges::equal(markers, dialect->markers))
+    return dialect->reasoning_markers;
   static constexpr std::array<std::string_view, 1> qwen{
       tokenization::QwenToolSyntax::kNativeCallOpen};
   static constexpr std::array<std::string_view, 2> deepseek{
@@ -201,7 +209,7 @@ ToolCloserSet ToolClosers(
   // As in llama.cpp, DeepSeek content is everything outside its native call
   // block, which ends the output: there is no echo to strip, and client
   // envelope syntax the model writes stays visible text.
-  if (*format == Format::kDeepSeek)
+  if (*format == Format::kDeepSeek || *format == Format::kDeepSeek41)
     return {};
   // Mirror ToolMarkers: stripping follows the dialect the request admitted,
   // and another dialect's closing tags are ordinary prose like its openers —
@@ -1770,7 +1778,10 @@ void ParseDsmlCalls(
       dialect_markers.push_back(marker);
   }
   const auto* dialect =
-      ext::FindToolDialect(sampling::JsonConstraint::ToolFormat::kDeepSeek);
+      ext::FindToolDialect(sampling::JsonConstraint::ToolFormat::kDeepSeek41);
+  if (!dialect || !std::ranges::equal(markers, dialect->markers))
+    dialect =
+        ext::FindToolDialect(sampling::JsonConstraint::ToolFormat::kDeepSeek);
   if (dialect == nullptr || dialect->scan_tool_calls == nullptr)
     return;
   std::vector<ext::ScannedToolCall> scanned;

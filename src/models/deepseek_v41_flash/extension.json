@@ -2,7 +2,7 @@
   "schema": 1,
   "name": "deepseek_v41_flash",
   "version": "0.1.0",
-  "api_version": ">= 0.1.19",
+  "api_version": ">= 0.1.20",
   "entry": "deepseek_v41_flash_register",
   "registration_target": "gufo_deepseek_v41_flash",
   "depends": [],
@@ -37,6 +37,11 @@
     "guide": "docs/models/deepseek-v4.1-flash/README.md"
   },
   "tests": [
+    {
+      "target": "ds41_tool_calls_test",
+      "ctest": "ds41\\.tool_calls",
+      "check_pr": true
+    },
     {
       "target": "ds41_chat_template_test",
       "ctest": "ds41\\.template",

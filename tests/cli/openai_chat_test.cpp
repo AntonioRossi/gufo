@@ -25,6 +25,10 @@ namespace gufo::models::deepseek_v4_flash {
 void RegisterToolDialect();
 }
 
+namespace gufo::models::deepseek_v41_flash {
+void RegisterToolDialect();
+}
+
 using gufo::tokenization::kImEnd;
 
 namespace {
@@ -1501,6 +1505,76 @@ void TestDeepSeekToolCallsAreStructured() {
       response.body.find(R"(\"path\":\"/etc/hostname\")") != std::string::npos,
       "Hybrid DeepSeek tool arguments are translated");
 }
+
+#ifdef GUFO_TEST_DEEPSEEK41_TOOLS
+void TestDeepSeek41ToolHistory() {
+  using gufo::json::Value;
+  using Choice = gufo::server::ChatRequest::ToolChoice;
+  const std::string call =
+      "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"read\">\n"
+      "<｜DSML｜ parameter name=\"path\" string=\"true\">file.txt"
+      "</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+  const auto original = gufo::json::parse(R"({
+    "model":"test-model","reasoning_effort":"none",
+    "messages":[{"role":"user","content":"Read file.txt."}],
+    "tools":[{"type":"function","function":{"name":"read","parameters":{
+      "type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}],
+    "parallel_tool_calls":false})");
+  for (const auto* choice : {"auto", "none", "required", "forced"}) {
+    auto body = original;
+    body["tool_choice"] =
+        std::string_view(choice) == "forced"
+            ? gufo::json::parse(
+                  R"({"type":"function","function":{"name":"read"}})")
+            : Value(choice);
+    FakeBackend backend;
+    backend.tool_format =
+        gufo::sampling::JsonConstraint::ToolFormat::kDeepSeek41;
+    backend.pieces = {call};
+    const auto response =
+        gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+    Expect(response.status == 200, "V4.1 tool controls are accepted");
+    const auto result = gufo::json::parse(response.body);
+    const auto& selected = result.find("choices")->items().front();
+    const auto& message = *selected.find("message");
+    if (std::string_view(choice) == "none") {
+      Expect(!message.contains("tool_calls") &&
+                 selected.member_str("finish_reason") == "stop",
+             "Disabled V4.1 calls remain text");
+      continue;
+    }
+    Expect(message.find("content")->is_null() &&
+               selected.member_str("finish_reason") == "tool_calls",
+           "A V4.1 call has null content and the tool finish reason");
+    const auto& tool = message.find("tool_calls")->items().front();
+    Expect(tool.find("function")->member_str("name") == "read" &&
+               gufo::json::parse(tool.find("function")->member_str("arguments"))
+                       .member_str("path") == "file.txt",
+           "Keep the V4.1 function name and arguments");
+    if (std::string_view(choice) == "forced")
+      Expect(backend.last_request.forced_tool_name == "read" &&
+                 backend.last_request.tool_choice == Choice::kRequired,
+             "Forced selection keeps its name and required constraint");
+    body["messages"].push_back(message);
+    auto output = gufo::json::parse(R"({"role":"tool","content":"DONE"})");
+    output["tool_call_id"] = tool.member_str("id");
+    body["messages"].push_back(output);
+    body["tool_choice"] = "none";
+    backend.pieces = {"DONE"};
+    const auto continued =
+        gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+    Expect(continued.status == 200 &&
+               backend.last_request.messages.size() == 3 &&
+               backend.last_request.messages[1].tool_calls.front().id ==
+                   tool.member_str("id") &&
+               backend.last_request.messages[2].tool_call_id ==
+                   tool.member_str("id") &&
+               backend.last_request.messages[2].content == "DONE",
+           "The follow-up retains the assistant call and matching tool result");
+  }
+}
+
+#endif
 
 void TestDeepSeekRepeatedToolParameters() {
   const auto call = [](std::string_view repeat) {
@@ -3331,14 +3405,24 @@ void TestStopInsideToolArguments() {
 void TestNativeToolImplicitReasoningEnd() {
   using Format = gufo::sampling::JsonConstraint::ToolFormat;
   using Finish = gufo::server::TextGenerationBackend::FinishReason;
-  for (const auto format : {Format::kQwen, Format::kDeepSeek}) {
+  for (const auto format : {
+           Format::kQwen,
+           Format::kDeepSeek,
+#ifdef GUFO_TEST_DEEPSEEK41_TOOLS
+           Format::kDeepSeek41,
+#endif
+       }) {
     const bool qwen = format == Format::kQwen;
     const std::string call =
         qwen ? "<tool_call>\n<function=read>\n<parameter=path>\nfile.txt\n"
                "</parameter>\n</function>\n</tool_call>"
-             : "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"read\">\n"
-               "<｜DSML｜parameter name=\"path\" string=\"true\">file.txt"
-               "</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        : format == Format::kDeepSeek
+            ? "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"read\">\n"
+              "<｜DSML｜parameter name=\"path\" string=\"true\">file.txt"
+              "</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+            : "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"read\">\n"
+              "<｜DSML｜ parameter name=\"path\" string=\"true\">file.txt"
+              "</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
     for (const bool responses : {false, true})
       for (const bool stream : {false, true})
         for (const bool quoted : {false, true})
@@ -6893,6 +6977,10 @@ void TestChatUsageReportsReasoningTokens() {
 
 int main() {
   gufo::models::deepseek_v4_flash::RegisterToolDialect();
+#ifdef GUFO_TEST_DEEPSEEK41_TOOLS
+  gufo::models::deepseek_v41_flash::RegisterToolDialect();
+  TestDeepSeek41ToolHistory();
+#endif
   TestLogprobs();
   TestToolCallRenderParseRoundTrip();
   TestToolTagBoundaries();

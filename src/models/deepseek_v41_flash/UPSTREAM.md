@@ -18,7 +18,7 @@ This first port supports text with one serial session on Linux `gfx1151`.
 The adapter supports ordinary autoregressive generation with resident or
 streamed experts. The selected check mode uses `--stream-experts` and
 `--expert-cache-bytes 68719476736`. The imported loader reads Engram data
-from the SSD. The adapter does not enable DSpark, vision, tool calls, request
+from the SSD. The adapter does not enable DSpark, vision, request
 batching, prefix reuse, snapshots, or persistent prompt caching.
 This port does not claim conformance.
 
@@ -55,7 +55,12 @@ It reports the existing `ExpertCacheStatus` outside the measured intervals.
 decoding, nonzero depth, concurrency, and prefill validation are not exposed
 by this first benchmark path. Prompt, chat, and HTTP paths are unchanged.
 
-The host target contains the chat template, sampling, probe, and registration.
+The host target contains the chat template, tool scanner, sampling, probe,
+and registration. `ConvertChat` maps text requests and tool history into the
+source template types. The runner selects the native `kDeepSeek41` grammar.
+The HTTP parser uses the registered dialect and the existing response and
+streaming paths. Required and forced tool selection use the shared server
+constraints. Image input remains unsupported.
 The HIP target contains the engine, runtime, adapter, and non-MMQ kernels.
 The MMQ target keeps its source compiler settings and generated type objects.
 The import uses the public forwarding headers for core declarations.
@@ -64,8 +69,9 @@ through `gufo/ext/host.hpp`.
 
 The import excludes `vision/`, `continuation_adapter.cpp`, and
 `continuation_adapter.hpp`. It also excludes the unused `reference/`,
-`artifact_hint.hpp`, `dspark_sampler.hpp`, and `tool_calls.cpp`.
-`tool_calls.hpp` supplies constants for the chat template. The source CMake
+`artifact_hint.hpp`, and `dspark_sampler.hpp`.
+The source scanner uses the existing extension argument and call types.
+Its parsing rules are unchanged. The source CMake
 file is replaced by `extension.cmake`.
 The selected test source keeps its cases and assertions. Formatting follows
 the port base. `fixtures/encoding-1017.json` is copied without changes.

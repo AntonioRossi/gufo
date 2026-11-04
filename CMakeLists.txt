@@ -773,6 +773,10 @@ endfunction()
   )
   target_link_libraries(openai_chat_test PRIVATE gufo_core gufo_logging gufo_http
     gufo_deepseek_v4_flash_text ${GUFO_QWEN_LIBRARIES})
+  if(TARGET gufo_deepseek_v41_flash)
+    target_link_libraries(openai_chat_test PRIVATE gufo_deepseek_v41_flash)
+    target_compile_definitions(openai_chat_test PRIVATE GUFO_TEST_DEEPSEEK41_TOOLS)
+  endif()
   add_test(NAME openai_chat_test COMMAND openai_chat_test)
   set_tests_properties(openai_chat_test PROPERTIES
     LABELS "cpu;server;api;openai;streaming;tools")

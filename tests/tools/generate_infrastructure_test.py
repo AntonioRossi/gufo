@@ -27,6 +27,7 @@ class GenerateInfrastructureTest(unittest.TestCase):
         manifests = GEN.load_manifests(ROOT)
         names = [m["name"] for m in manifests]
         expected = [
+            "deepseek_v41_flash",
             "deepseek_v4_flash",
             "embedding_gemma2",
             "minimax_h3",

@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <gufo/ext/json.hpp>
 #include <gufo/ext/sha256.hpp>
+#include <gufo/ext/text.hpp>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -16,6 +18,22 @@
 
 namespace gufo::models::deepseek_v41_flash {
 namespace {
+
+std::string RoleName(ext::ChatRole role) {
+  switch (role) {
+    case ext::ChatRole::kSystem:
+      return "system";
+    case ext::ChatRole::kDeveloper:
+      return "developer";
+    case ext::ChatRole::kUser:
+      return "user";
+    case ext::ChatRole::kAssistant:
+      return "assistant";
+    case ext::ChatRole::kTool:
+      return "tool";
+  }
+  throw std::invalid_argument("DeepSeek V4.1 chat role is invalid");
+}
 
 constexpr std::string_view kBos = "<｜begin▁of▁sentence｜>";
 constexpr std::string_view kEos = "<｜end▁of▁sentence｜>";
@@ -273,6 +291,50 @@ std::string MessageContent(const ChatMessage& message) {
 }
 
 }  // namespace
+
+ChatInput ConvertChat(const ext::ChatRequest& request) {
+  if (request.add_vision_id)
+    throw std::invalid_argument("DeepSeek V4.1 vision is not supported");
+  ChatInput input;
+  input.messages.reserve(request.messages.size());
+  for (const auto& message : request.messages) {
+    if (!message.images.empty())
+      throw std::invalid_argument("DeepSeek V4.1 image input is not supported");
+    ChatMessage converted{
+        .role = RoleName(message.role),
+        .content = message.content + message.framing_suffix,
+        .reasoning_content = message.thought,
+        .tool_calls = {},
+        .tool_call_id = message.tool_call_id,
+        .image_offsets = {},
+    };
+    for (const auto& call : message.tool_calls) {
+      ChatMessage::ToolCall converted_call{
+          .name = call.name, .arguments = {}, .id = call.id};
+      for (const auto& argument : call.arguments)
+        converted_call.arguments.push_back({.name = argument.name,
+                                            .value = argument.value,
+                                            .is_string = argument.is_string});
+      converted.tool_calls.push_back(std::move(converted_call));
+    }
+    input.messages.push_back(std::move(converted));
+  }
+  if (request.tool_choice != ext::ChatRequest::ToolChoice::kNone) {
+    for (const auto& tool : request.tools)
+      input.tools.push_back({
+          .name = tool.name,
+          .description = tool.description,
+          .parameters_json = tool.parameters_json,
+          .definition_json =
+              tool.definition_json.empty()
+                  ? std::string{}
+                  : json::parse(tool.definition_json)["function"].dump(),
+      });
+  }
+  input.options = ResolveDeepSeekChatOptions(request.reasoning);
+  input.options.tools_present = !input.tools.empty();
+  return input;
+}
 
 ChatTemplateOptions ResolveDeepSeekChatOptions(
     const ReasoningOptions& reasoning) {

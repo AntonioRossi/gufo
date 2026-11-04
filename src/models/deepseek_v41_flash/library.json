@@ -3,7 +3,7 @@
   "name": "deepseek_v41_flash",
   "target": "gufo_deepseek_v41_flash",
   "kind": "static",
-  "purpose": "DeepSeek V4.1 Flash host code: chat template, sampling, GGUF probe, and extension registration.",
+  "purpose": "DeepSeek V4.1 Flash host code: chat template, tool calls, sampling, GGUF probe, and extension registration.",
   "consumers": [],
-  "checks": ["ds41_chat_template_test"]
+  "checks": ["ds41_chat_template_test", "ds41_tool_calls_test", "openai_chat_test"]
 }

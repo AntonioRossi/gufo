@@ -4,6 +4,7 @@ gufo_extension_target(
   NAME gufo_deepseek_v41_flash
   SOURCES
     chat_template.cpp
+    tool_calls.cpp
     runtime/sampling.cpp
     probe.cpp
     extension.cpp
