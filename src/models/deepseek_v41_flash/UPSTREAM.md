@@ -15,11 +15,23 @@ The common ancestor, for attribution, is
 `12effe369662ac572cb100cd20157f56a74e2da0`.
 
 This first port supports text with one serial session on Linux `gfx1151`.
-The adapter uses resident backbone weights and ordinary autoregressive
-generation. The imported loader reads Engram data from the SSD. The adapter
-does not enable DSpark, expert streaming, vision, tool calls, request
+The adapter supports ordinary autoregressive generation with resident or
+streamed experts. The selected check mode uses `--stream-experts` and
+`--expert-cache-bytes 68719476736`. The imported loader reads Engram data
+from the SSD. The adapter does not enable DSpark, vision, tool calls, request
 batching, prefix reuse, snapshots, or persistent prompt caching.
 This port does not claim conformance.
+
+Streaming uses `Model::Load`, `Model::FitExpertCache`, and the expert store
+from the pinned source. The adapter fits the cache after its one session
+and persistent buffers exist. Snapshots and prompt-cache backing are absent.
+The source cap, cache-fit calculations, and memory reserves are unchanged.
+The added `ExpertCacheStatus` getter reports the store's requested limit,
+allocated bytes, and current limit. It does not alter allocation.
+The host forwards both options through `TextPromptOptions` and
+`TextRunnerOptions`. Other providers retain false and zero defaults.
+The optional probe status and its small stage component are local check
+additions. The loader's generic failure reason is `engine_open_failed`.
 
 Native YaRN remains in the imported decoder. The adapter rejects the
 `--enable-yarn` option for additional Qwen context scaling.

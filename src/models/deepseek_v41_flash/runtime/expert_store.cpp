@@ -1896,6 +1896,15 @@ ds41_expert_store_stats ds41_expert_store_get_stats(
   return store ? store->stats : ds41_expert_store_stats{};
 }
 
+ds41_expert_cache_status ds41_expert_store_get_cache_status(const ds41_expert_store* store) {
+  if (!store)
+    return {};
+  return {.enabled = true,
+          .requested_bytes = store->requested_limit,
+          .allocated_bytes = store->stats.cache_bytes,
+          .limit_bytes = store->cache_limit};
+}
+
 void ds41_expert_store_log(const ds41_expert_store* store) {
   if (!store || !store->stats.uses)
     return;

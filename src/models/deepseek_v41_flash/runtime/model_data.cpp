@@ -2054,6 +2054,10 @@ int ds41_engine_fit_experts(ds41_engine* e, uint64_t pending_bytes) {
   return 0;
 }
 
+ds41_expert_cache_status ds41_engine_expert_cache_status(const ds41_engine* e) {
+  return ds41_expert_store_get_cache_status(e ? e->expert_store : nullptr);
+}
+
 bool ds41_engine_has_dspark(const ds41_engine* e) {
   return e && e->dspark && e->dspark->device;
 }

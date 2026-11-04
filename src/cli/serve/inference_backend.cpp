@@ -214,7 +214,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                             const TextDiskCacheConfig& disk_cache_config,
                             const std::string& vision_model_path,
                             TextRunnerRamCacheOptions ram_cache_config,
-                            bool enable_yarn) {
+                            bool enable_yarn, bool stream_experts,
+                            std::uint64_t expert_cache_bytes) {
   std::string load_error;
   auto reader_owner = core::GgufReader::OpenFile(model_path, &load_error);
   if (reader_owner == nullptr) {
@@ -227,6 +228,11 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     SetError(error, "No text provider found for model architecture");
     return false;
   }
+  if ((stream_experts || expert_cache_bytes != 0) &&
+      !provider->supports_expert_streaming) {
+    SetError(error, "This model does not support expert streaming");
+    return false;
+  }
   ext::TextRunnerOptions options{
       .model_path = model_path,
       .reader = reader,
@@ -237,6 +243,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
       .disk_cache = disk_cache_config,
       .ram_cache = ram_cache_config,
       .enable_yarn = enable_yarn,
+      .stream_experts = stream_experts,
+      .expert_cache_bytes = expert_cache_bytes,
   };
   auto runner = provider->create(options, error);
   if (runner == nullptr) {
@@ -258,7 +266,8 @@ bool InferenceBackend::load(const std::string&, std::string* error,
                             std::uint32_t, std::size_t, TextPrefillPolicy,
                             TextSchedulerPolicy, const TextSpeculativeConfig&,
                             const TextDiskCacheConfig&, const std::string&,
-                            TextRunnerRamCacheOptions, bool) {
+                            TextRunnerRamCacheOptions, bool, bool,
+                            std::uint64_t) {
   SetError(error, "HIP engine is disabled");
   return false;
 }

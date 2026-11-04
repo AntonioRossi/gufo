@@ -7,7 +7,13 @@ Its optional functions exceed this port's scope.
 
 The `deepseek41` provider supports text through `prompt`, `chat`, and the
 HTTP text interface. This first port targets Linux x86-64 and AMD `gfx1151`.
-Use one session and serial execution. The backbone weights stay resident.
+Use one session and serial execution. The selected check mode streams
+routed experts from SSD with `--stream-experts --expert-cache-bytes 68719476736`.
+The source runtime keeps dense weights resident. The cache value is an
+upper limit of 64 GiB; the cache can be smaller after session allocation.
+The adapter calls `Model::FitExpertCache` after that allocation and reports
+the requested limit and actual cache through `event=expert_streaming`.
+Without the options, the runtime retains its resident default.
 The imported loader reads Engram data from the SSD.
 
 The selected artifact is ISTA GSQ-RCO `IQ1_M` at revision
@@ -18,8 +24,8 @@ Engram file under the matching shard-6 name. The bundle contains several
 expert types; `IQ1_M` is not the only type.
 
 The adapter rejects vision, tool calls, speculative decoding, and explicit
-prompt-cache settings. It does not expose expert streaming or request
-batching. Prefix reuse, snapshots, and persistent prompt caching are
+prompt-cache settings. It does not expose request batching.
+Prefix reuse, snapshots, and persistent prompt caching are
 unavailable. Each CLI chat turn creates a new session.
 
 The imported decoder keeps native YaRN. The `--enable-yarn` option is
@@ -39,6 +45,9 @@ files are `ds41.template`, `qwen38_flash_next.prompt_lookup`,
 `ds41.mmq_typed`, `ds41.attention`, `ds41.hc_state_pass`, and
 `ds41.candidate_mask`. The last four need a `gfx1151` HIP device.
 These checks do not establish model loading or HTTP generation.
+The CPU `ds41.probe_status` check covers the optional probe status component.
+The probe writes one atomic status file with `--status-json`. It records
+the requested streaming values and the actual expert store separately.
 
 See [source attribution and import limits](../../../src/models/deepseek_v41_flash/UPSTREAM.md)
 and the [test guide](../../TESTING.md). A discovery build selects this

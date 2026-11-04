@@ -7,6 +7,11 @@ target_compile_definitions(ds41_chat_template_test PRIVATE
 add_test(NAME ds41.template COMMAND ds41_chat_template_test)
 set_tests_properties(ds41.template PROPERTIES LABELS "cpu;ds41;tokenization")
 
+add_executable(ds41_probe_status_test probe_status_test.cpp)
+target_link_libraries(ds41_probe_status_test PRIVATE gufo_core)
+add_test(NAME ds41.probe_status COMMAND ds41_probe_status_test)
+set_tests_properties(ds41.probe_status PROPERTIES LABELS "cpu;ds41")
+
 if(TARGET gufo_deepseek_v41_flash_hip)
   foreach(ds41_test mmq_typed attention hc_state_pass candidate_mask)
     add_executable(ds41_${ds41_test}_test ${ds41_test}_test.cpp)

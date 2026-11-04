@@ -27,9 +27,9 @@ set(gufo_pr_targets
   component_text_cache_test text_model_runner_test continuation_disk_store_test
   bench_cli_test prompt_cli_test text_cli_dispatch_test eval_http_client_test
   # BEGIN GENERATED MODEL PR TARGETS
-  deepseek_v4_flash_continuation_identity_test ds41_chat_template_test ds4_chat_template_test
-  ds4_cli_test ds4_sampling_test embedding_gemma2_batch_scheduler_test embedding_gemma2_config_test
-  embedding_gemma2_embeddings_api_test embedding_gemma2_image_processor_test
+  deepseek_v4_flash_continuation_identity_test ds41_chat_template_test ds41_probe_status_test
+  ds4_chat_template_test ds4_cli_test ds4_sampling_test embedding_gemma2_batch_scheduler_test
+  embedding_gemma2_config_test embedding_gemma2_embeddings_api_test embedding_gemma2_image_processor_test
   embedding_gemma2_video_processor_test minimax_h3_runtime_test minimax_h3_sampling_test
   qwen27b_continuation_identity_test qwen27b_continuation_layout_test qwen38_flash_next_config_test
   qwen38_flash_next_continuation_identity_test qwen38_flash_next_continuation_layout_test
@@ -47,13 +47,13 @@ if(NOT WIN32)
 endif()
 # BEGIN GENERATED MODEL CTEST OVERRIDES
 list(REMOVE_ITEM gufo_pr_tests
-  ds41_chat_template_test ds4_chat_template_test ds4_cli_test ds4_sampling_test
-  qwen38_flash_next_config_test qwen38_flash_next_continuation_layout_test
+  ds41_chat_template_test ds41_probe_status_test ds4_chat_template_test ds4_cli_test
+  ds4_sampling_test qwen38_flash_next_config_test qwen38_flash_next_continuation_layout_test
   qwen38_flash_next_mtp_sampling_test qwen38_flash_next_rope_scaling_test
   qwen38_flash_next_runner_options_test)
 list(APPEND gufo_pr_tests
-  "ds41\.template" "ds4\.template" "ds4\.cli" "ds4\.sampling" "qwen38_flash_next\.config"
-  "qwen38_flash_next\.continuation_layout" "qwen38_flash_next\.mtp_sampling"
+  "ds41\.template" "ds41\.probe_status" "ds4\.template" "ds4\.cli" "ds4\.sampling"
+  "qwen38_flash_next\.config" "qwen38_flash_next\.continuation_layout" "qwen38_flash_next\.mtp_sampling"
   "qwen38_flash_next\.rope_scaling" "qwen38_flash_next\.runner_options")
 # END GENERATED MODEL CTEST OVERRIDES
 list(APPEND gufo_pr_tests

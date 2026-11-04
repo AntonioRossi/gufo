@@ -274,6 +274,10 @@ void Model::FitExpertCache(std::uint64_t pending_bytes) {
     (void)ds41_engine_fit_experts(engine_, pending_bytes);
 }
 
+ds41_expert_cache_status Model::ExpertCacheStatus() const {
+  return ds41_engine_expert_cache_status(engine_);
+}
+
 bool Model::EnableImageRouting(std::string* error_msg) {
   if (ds41_engine_enable_image_routing(engine_) != 0) {
     AssignError(error_msg, "cannot set the DeepSeek V4.1 image routing bias");

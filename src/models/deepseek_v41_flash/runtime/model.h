@@ -146,6 +146,14 @@ void ds41_engine_close(ds41_engine* engine);
  * other long-lived buffers exist; pending_bytes is what the caller will still
  * allocate later (cache backing that grows with use). 0 on success. */
 int ds41_engine_fit_experts(ds41_engine* engine, uint64_t pending_bytes);
+struct ds41_expert_cache_status {
+  bool enabled = false;
+  uint64_t requested_bytes = 0;
+  uint64_t allocated_bytes = 0;
+  uint64_t limit_bytes = 0;
+};
+/* Read the effective expert-store mode, explicit cap, and allocation. */
+ds41_expert_cache_status ds41_engine_expert_cache_status(const ds41_engine* engine);
 int ds41_engine_vocab_size(const ds41_engine* engine);
 const char* ds41_engine_model_name(const ds41_engine* engine);
 

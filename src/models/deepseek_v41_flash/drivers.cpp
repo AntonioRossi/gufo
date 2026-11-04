@@ -63,6 +63,8 @@ std::shared_ptr<ext::TextModelRunner> LoadRunner(
   runner_options.reader = std::shared_ptr<const core::GgufReader>(
       &reader, [](const core::GgufReader*) {});
   runner_options.max_context = kDefaultContext;
+  runner_options.stream_experts = options.stream_experts;
+  runner_options.expert_cache_bytes = options.expert_cache_bytes;
   runner_options.ram_cache.enabled = false;
   std::string error;
   auto runner = CreateDeepSeekTextRunner(runner_options, &error);

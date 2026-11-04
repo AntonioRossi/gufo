@@ -574,6 +574,8 @@ struct TextRunnerOptions {
   TextDiskCacheConfig disk_cache{};
   TextRunnerRamCacheOptions ram_cache{};
   bool enable_yarn{false};
+  bool stream_experts{false};
+  std::uint64_t expert_cache_bytes{0};
 };
 
 struct TextBenchOptions {
@@ -625,6 +627,8 @@ struct TextPromptOptions {
   std::string dspark_model_path;
   std::uint32_t draft_tokens{7};
   std::uint32_t min_draft_tokens{1};
+  bool stream_experts{false};
+  std::uint64_t expert_cache_bytes{0};
 };
 
 struct ScannedToolArgument {
@@ -677,6 +681,7 @@ struct TextProvider {
   TextBenchDriver bench_driver = nullptr;
   TextPromptDriver prompt_driver = nullptr;
   TextChatDriver chat_driver = nullptr;
+  bool supports_expert_streaming{false};
 };
 
 void RegisterTextProvider(TextProvider provider);

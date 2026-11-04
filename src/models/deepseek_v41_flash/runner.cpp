@@ -1,6 +1,7 @@
 #include "src/models/deepseek_v41_flash/runner.hpp"
 
 #include <algorithm>
+#include <gufo/ext/host.hpp>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -30,6 +31,19 @@ public:
     if (!session_)
       throw std::runtime_error("DeepSeek V4.1 session creation failed: " +
                                error);
+    // This port has one session and no snapshot or prompt-cache backing.
+    // The session and its long-lived buffers exist before the cache fit.
+    execution_->model->FitExpertCache(0);
+    const auto cache = execution_->model->ExpertCacheStatus();
+    if (cache.enabled) {
+      gufo::server::Logger::LogFormatted(
+          gufo::server::LogLevel::kInfo, "ds41",
+          "event=expert_streaming stream_experts=true expert_cache_bytes=%llu "
+          "cache_bytes=%llu cache_limit_bytes=%llu",
+          static_cast<unsigned long long>(cache.requested_bytes),
+          static_cast<unsigned long long>(cache.allocated_bytes),
+          static_cast<unsigned long long>(cache.limit_bytes));
+    }
   }
 
   ~State() override {
@@ -314,6 +328,8 @@ std::shared_ptr<ext::TextModelRunner> CreateDeepSeekTextRunner(
       throw std::invalid_argument("DeepSeek V4.1 needs a valid context length");
     ModelOptions model_options;
     model_options.max_context = static_cast<std::uint32_t>(context);
+    model_options.stream_experts = options.stream_experts;
+    model_options.expert_cache_bytes = options.expert_cache_bytes;
     auto model = Model::Load(options.model_path, model_options, &detail);
     if (!model)
       throw std::runtime_error("Cannot load DeepSeek V4.1: " + detail);

@@ -15,5 +15,6 @@ void deepseek_v41_flash_provider_register(gufo::ext::Registry& registry) {
       .create = &gufo::models::deepseek_v41_flash::CreateDeepSeekTextRunner,
       .prompt_driver = &gufo::models::deepseek_v41_flash::RunDeepSeekPrompt,
       .chat_driver = &gufo::models::deepseek_v41_flash::RunDeepSeekChat,
+      .supports_expert_streaming = true,
   });
 }

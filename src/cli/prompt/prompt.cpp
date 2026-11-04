@@ -85,6 +85,15 @@ void RegisterTextOptions(ArgParser& parser, PromptOptions& opt,
                    &opt.model_path);
   RegisterImageOptions(parser, opt);
 
+  parser.AddFlag(
+      "", "--stream-experts",
+      "DeepSeek V4.1: read routed experts from SSD through a bounded cache",
+      "Model", &opt.stream_experts);
+  parser.AddOption("", "--expert-cache-bytes", "N",
+                   "DeepSeek V4.1: expert cache limit in bytes; requires "
+                   "--stream-experts (0 = automatic)",
+                   "Model", &opt.expert_cache_bytes);
+
   // Prompt & Formatting
   if (command == "prompt") {
     parser.AddOption("-p", "--prompt", "TEXT", "Direct input prompt text",
@@ -380,6 +389,11 @@ int RunPrompt(std::span<const char* const> args) {
     PrintModelLoadTime(model_load_start, false);
     return 1;
   }
+  if ((opt.stream_experts || opt.expert_cache_bytes != 0) &&
+      !provider->supports_expert_streaming) {
+    std::cerr << "Error: this model does not support expert streaming\n";
+    return 1;
+  }
   return provider->prompt_driver(opt, *reader, model_load_start);
 }
 
@@ -421,6 +435,11 @@ int RunChat(std::span<const char* const> args) {
   if (provider == nullptr || provider->chat_driver == nullptr) {
     std::cerr << "Error: unsupported model architecture for chat\n";
     PrintModelLoadTime(model_load_start, false);
+    return 1;
+  }
+  if ((opt.stream_experts || opt.expert_cache_bytes != 0) &&
+      !provider->supports_expert_streaming) {
+    std::cerr << "Error: this model does not support expert streaming\n";
     return 1;
   }
   return provider->chat_driver(opt, *reader, model_load_start);

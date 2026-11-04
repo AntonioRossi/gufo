@@ -16,10 +16,67 @@
 #include <thread>
 #include <vector>
 
+#include "probe_status.hpp"
 #include "src/models/deepseek_v41_flash/runtime/model.h"
 #include "src/models/deepseek_v41_flash/runtime/v41_dspark.h"
 
 namespace {
+using gufo::tests::ds41::ProbeStages;
+using gufo::tests::ds41::Stage;
+
+struct ProbeStatus {
+  const char* path = nullptr;
+  ProbeStages stages;
+  bool upload = false;
+  bool ordinary = false;
+  bool requested_streaming = false;
+  std::uint64_t requested_cache_bytes = 0;
+  ds41_expert_cache_status expert_cache{};
+  unsigned tokenized_lines = 0;
+  unsigned tokenized_tokens = 0;
+
+  bool Write(int exit_code) const {
+    if (!path)
+      return true;
+    const std::string temporary = std::string(path) + ".tmp";
+    FILE* file = std::fopen(temporary.c_str(), "wx");
+    if (!file) {
+      std::perror("Cannot create probe status");
+      return false;
+    }
+    const bool written =
+        std::fprintf(
+            file,
+            "{\n  \"schema\": 1,\n  \"complete\": true,\n  \"exit_code\": %d,\n"
+            "  \"upload\": %s,\n  \"ordinary\": %s,\n"
+            "  \"loading\": \"%s\",\n  \"tokenization\": \"%s\",\n"
+            "  \"prefill\": \"%s\",\n  \"decode\": \"%s\",\n"
+            "  \"reason\": \"%s\",\n"
+            "  \"tokenized_lines\": %u,\n  \"tokenized_tokens\": %u,\n"
+            "  \"requested_stream_experts\": %s,\n"
+            "  \"requested_expert_cache_bytes\": %llu,\n"
+            "  \"expert_cache\": {\"enabled\": %s, \"requested_bytes\": %llu, "
+            "\"allocated_bytes\": %llu, \"limit_bytes\": %llu}\n}\n",
+            exit_code, upload ? "true" : "false", ordinary ? "true" : "false",
+            stages.Name(Stage::kLoading), stages.Name(Stage::kTokenization),
+            stages.Name(Stage::kPrefill), stages.Name(Stage::kDecode),
+            stages.Reason(), tokenized_lines, tokenized_tokens,
+            requested_streaming ? "true" : "false",
+            static_cast<unsigned long long>(requested_cache_bytes),
+            expert_cache.enabled ? "true" : "false",
+            static_cast<unsigned long long>(expert_cache.requested_bytes),
+            static_cast<unsigned long long>(expert_cache.allocated_bytes),
+            static_cast<unsigned long long>(expert_cache.limit_bytes)) >= 0;
+    const bool closed = std::fclose(file) == 0;
+    if (!written || !closed || std::rename(temporary.c_str(), path) != 0) {
+      std::perror("Cannot write probe status");
+      std::remove(temporary.c_str());
+      return false;
+    }
+    return true;
+  }
+};
+
 std::uint64_t MeminfoKiB(const char* key) {
   std::ifstream in("/proc/meminfo");
   std::string name;
@@ -732,7 +789,7 @@ int ReplayProbe(ds41_engine* engine, const std::vector<int>& ids,
   return 0;
 }
 
-int main(int argc, char** argv) {
+int RunProbe(int argc, char** argv, ProbeStatus& status) {
   const char* model = nullptr;
   const char* tokenize = nullptr;
   const char* decode = nullptr;
@@ -759,7 +816,11 @@ int main(int argc, char** argv) {
   bool stream_experts = false;
   uint64_t expert_cache_bytes = 0;
   for (int i = 1; i < argc; ++i) {
-    if (std::strcmp(argv[i], "--tokenize") == 0 && i + 1 < argc) {
+    if (std::strcmp(argv[i], "--status-json") == 0) {
+      if (i + 1 == argc)
+        return 2;
+      status.path = argv[++i];
+    } else if (std::strcmp(argv[i], "--tokenize") == 0 && i + 1 < argc) {
       tokenize = argv[++i];
     } else if (std::strcmp(argv[i], "--decode") == 0 && i + 1 < argc) {
       decode = argv[++i];
@@ -828,7 +889,7 @@ int main(int argc, char** argv) {
   if (!model) {
     std::fprintf(
         stderr,
-        "usage: %s MODEL-00001-of-N.gguf [--upload] "
+        "usage: %s MODEL-00001-of-N.gguf [--upload] [--status-json FILE] "
         "[--tokenize TEXTS [--rendered]] [--decode IDS [--generate N] "
         "[--score] [--batch] [--context N] [--prefill-batch N] "
         "[--out DIR]] [--replay-check ROWS] [--exact-prefill] "
@@ -852,8 +913,18 @@ int main(int argc, char** argv) {
   options.stream_experts = stream_experts;
   options.expert_cache_bytes = expert_cache_bytes;
   options.dspark_model_path = dspark;
-  if (ds41_engine_open(&engine, &options) != 0)
+  status.upload = upload;
+  status.requested_streaming = stream_experts;
+  status.requested_cache_bytes = expert_cache_bytes;
+  status.ordinary = decode && !replay_check && !spec_check && spec_bench < 0 &&
+                    joint_check <= 0 && dspark_generate <= 0 && !dspark_dump;
+  status.stages.Transition(Stage::kLoading, 0, 1);
+  if (ds41_engine_open(&engine, &options) != 0) {
+    status.stages.Transition(Stage::kLoading, 0, 1, "engine_open_failed");
     return 1;
+  }
+  status.stages.Transition(Stage::kLoading, 1, 1);
+  status.expert_cache = ds41_engine_expert_cache_status(engine);
   const double seconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - begin)
           .count();
@@ -865,6 +936,7 @@ int main(int argc, char** argv) {
     /* One text per line; "\n" in a line stands for a newline. Prints the ids.
      */
     std::ifstream in(tokenize);
+    status.stages.Transition(Stage::kTokenization, 0, 1);
     std::string line;
     while (std::getline(in, line)) {
       std::string text;
@@ -881,12 +953,22 @@ int main(int argc, char** argv) {
         ds41_tokenize_rendered_chat(engine, text.c_str(), &tokens);
       else
         ds41_tokenize_text(engine, text.c_str(), &tokens);
+      ++status.tokenized_lines;
+      status.tokenized_tokens += tokens.len;
       std::printf("ids");
       for (int i = 0; i < tokens.len; ++i)
         std::printf(" %d", tokens.v[i]);
       std::printf("\n");
       ds41_tokens_free(&tokens);
     }
+    const bool tokenized =
+        in.eof() && status.tokenized_lines > 0 && status.tokenized_tokens > 0;
+    status.stages.Transition(Stage::kTokenization, tokenized ? 1 : 0, 1,
+                             tokenized ? nullptr : "tokenization_failed");
+  }
+  if (decode && !status.ordinary) {
+    status.stages.Transition(Stage::kPrefill, 0, 1);
+    status.stages.Transition(Stage::kDecode, 0, 1);
   }
   if (decode && replay_check) {
     std::vector<int> ids;
@@ -932,10 +1014,14 @@ int main(int argc, char** argv) {
         ++p;
     }
     const uint32_t total = (uint32_t)tokens.size() + (uint32_t)generate;
+    status.stages.Transition(Stage::kPrefill, 0, tokens.size());
     ds41_decoder* decoder =
         ds41_decoder_create(engine, std::max(context, total + 1));
-    if (!decoder)
+    if (!decoder) {
+      status.stages.Transition(Stage::kPrefill, 0, tokens.size(),
+                               "decoder_create_failed");
       return 1;
+    }
     Report("decoder");
     Dump dump;
     if (out_dir) {
@@ -953,6 +1039,15 @@ int main(int argc, char** argv) {
     const size_t vocab = (size_t)ds41_engine_vocab_size(engine);
     std::vector<float> logits(vocab);
     std::vector<int> generated;
+    const uint32_t cap = ds41_decoder_batch_capacity(decoder);
+    std::vector<float> rows(batch ? static_cast<size_t>(cap) * vocab : 0);
+    // The decoder and probe buffers exist before the source cache-fit step.
+    if (stream_experts && ds41_engine_fit_experts(engine, 0) != 0) {
+      status.stages.Transition(Stage::kPrefill, 0, tokens.size(),
+                               "expert_cache_fit_failed");
+      return 1;
+    }
+    status.expert_cache = ds41_engine_expert_cache_status(engine);
     /* Records the logits of position `step` (input `token`). */
     auto consume = [&](uint32_t step, int token, const float* row, double ms) {
       if (logits_file)
@@ -980,8 +1075,6 @@ int main(int argc, char** argv) {
     uint32_t step = 0;
     if (batch) {
       /* The prompt in decoder-sized batches with logits for every position. */
-      const uint32_t cap = ds41_decoder_batch_capacity(decoder);
-      std::vector<float> rows((size_t)cap * vocab);
       while (step < tokens.size()) {
         const uint32_t n =
             std::min<uint32_t>(cap, (uint32_t)tokens.size() - step);
@@ -991,6 +1084,8 @@ int main(int argc, char** argv) {
         if (ds41_decoder_eval(decoder, tokens.data() + step, n, rows.data(),
                               logit_rows, nullptr, nullptr) != 0) {
           std::fprintf(stderr, "batch failed at step %u\n", step);
+          status.stages.Transition(Stage::kPrefill, step, tokens.size(),
+                                   "prefill_failed");
           return 1;
         }
         const double ms = std::chrono::duration<double, std::milli>(
@@ -1002,9 +1097,14 @@ int main(int argc, char** argv) {
           consume(step + i, tokens[step + i],
                   rows.data() + (size_t)(i - (n - logit_rows)) * vocab, ms / n);
         step += n;
+        status.stages.Transition(Stage::kPrefill, step, tokens.size());
       }
     }
     for (; step < total; ++step) {
+      const bool is_prompt = step < tokens.size();
+      if (!is_prompt)
+        status.stages.Transition(Stage::kDecode, step - tokens.size(),
+                                 generate);
       const int token = step < tokens.size() ? tokens[step] : generated.back();
       dump.pos = step;
       const auto t0 = std::chrono::steady_clock::now();
@@ -1012,12 +1112,20 @@ int main(int argc, char** argv) {
                             out_dir && !score ? DumpLayer : nullptr,
                             &dump) != 0) {
         std::fprintf(stderr, "decode failed at step %u\n", step);
+        status.stages.Transition(
+            is_prompt ? Stage::kPrefill : Stage::kDecode, 0, 1,
+            is_prompt ? "prefill_failed" : "decode_failed");
         return 1;
       }
       const double ms = std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - t0)
                             .count();
       consume(step, token, logits.data(), ms);
+      if (is_prompt)
+        status.stages.Transition(Stage::kPrefill, step + 1, tokens.size());
+      else
+        status.stages.Transition(Stage::kDecode, step + 1 - tokens.size(),
+                                 generate);
     }
     std::printf("generated");
     for (size_t i = 0;
@@ -1034,7 +1142,20 @@ int main(int argc, char** argv) {
     Report("evaluated");
     ds41_decoder_destroy(decoder);
   }
+  status.expert_cache = ds41_engine_expert_cache_status(engine);
   ds41_engine_close(engine);
   Report("closed");
   return 0;
+}
+
+int main(int argc, char** argv) {
+  ProbeStatus status;
+  int result = 1;
+  try {
+    result = RunProbe(argc, argv, status);
+  } catch (const std::exception& error) {
+    status.stages.Transition(Stage::kActive, 0, 1, "probe_exception");
+    std::fprintf(stderr, "Probe failed: %s\n", error.what());
+  }
+  return status.Write(result) ? result : 1;
 }

@@ -103,6 +103,7 @@ public:
   /// or seeding the room left. Call once the sessions exist; pending_bytes is
   /// memory the caller still allocates later (cache backing that grows).
   void FitExpertCache(std::uint64_t pending_bytes);
+  [[nodiscard]] ds41_expert_cache_status ExpertCacheStatus() const;
   /// Routes image positions with the MoE gates' image bias, for image
   /// prompts; enable it before creating sessions.
   [[nodiscard]] bool EnableImageRouting(std::string* error_msg = nullptr);

@@ -22,6 +22,18 @@ void TestDefaultOptions() {
   assert(!opt->verbose);
   assert(opt->draft_tokens == 7);
   assert(opt->min_draft_tokens == 1);
+  assert(!opt->stream_experts && opt->expert_cache_bytes == 0);
+}
+
+void TestExpertStreamingFlags() {
+  const char* args[] = {"--stream-experts", "--expert-cache-bytes",
+                        "68719476736", "Hello"};
+  const auto opt = gufo::cli::ParsePromptOptions(args);
+  assert(opt && opt->stream_experts);
+  assert(opt->expert_cache_bytes == 68719476736ULL);
+  std::string error;
+  assert(!gufo::cli::ParsePromptOptions(
+      std::array{"--expert-cache-bytes", "invalid"}, &error));
 }
 
 void TestExplicitFlags() {
@@ -203,6 +215,7 @@ void TestSamplingAndReasoningFlags() {
 
 int main() {
   TestDefaultOptions();
+  TestExpertStreamingFlags();
   TestExplicitFlags();
   TestSamplingAndReasoningFlags();
   TestFlashMtpFlags();

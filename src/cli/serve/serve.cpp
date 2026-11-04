@@ -689,6 +689,8 @@ void PrintServeHelp(std::string_view program_name,
     gufo::cli::ArgParser parser(
         std::string(program_name) + " serve llm",
         "Start the OpenAI/Anthropic-compatible text LLM HTTP server.");
+    bool stream_experts = false;
+    std::uint64_t expert_cache_bytes = 0;
 
     // Model & Context
     parser.AddOption("-m", "--model", "PATH",
@@ -708,6 +710,14 @@ void PrintServeHelp(std::string_view program_name,
                    "Flash-Next: static YaRN, required for --context above the "
                    "native 262144; it applies to every request",
                    "Model", &enable_yarn);
+    parser.AddFlag(
+        "", "--stream-experts",
+        "DeepSeek V4.1: read routed experts from SSD through a bounded cache",
+        "Model", &stream_experts);
+    parser.AddOption("", "--expert-cache-bytes", "N",
+                     "DeepSeek V4.1: expert cache limit in bytes; requires "
+                     "--stream-experts (0 = automatic)",
+                     "Model", &expert_cache_bytes);
 
     // Sampling Defaults
     parser.AddOption(
@@ -1351,6 +1361,8 @@ int RunServe(std::span<const char* const> args) {
     gufo::cli::ArgParser llm_parser(
         "gufo serve llm",
         "Start the OpenAI/Anthropic-compatible text LLM HTTP server.");
+    bool stream_experts = false;
+    std::uint64_t expert_cache_bytes = 0;
     llm_parser.AddOption("-m", "--model", "PATH",
                          "Path to GGUF model file (required)", "Model", &model);
     llm_parser.AddOption(
@@ -1381,6 +1393,14 @@ int RunServe(std::span<const char* const> args) {
                        "Flash-Next: static YaRN, required for --context above "
                        "the native 262144; it applies to every request",
                        "Model", &enable_yarn);
+    llm_parser.AddFlag(
+        "", "--stream-experts",
+        "DeepSeek V4.1: read routed experts from SSD through a bounded cache",
+        "Model", &stream_experts);
+    llm_parser.AddOption("", "--expert-cache-bytes", "N",
+                         "DeepSeek V4.1: expert cache limit in bytes; requires "
+                         "--stream-experts (0 = automatic)",
+                         "Model", &expert_cache_bytes);
     llm_parser.AddOption(
         "-n", "--max-tokens", "N",
         "Default new-token limit (default: -1 = until EOS or context full)",
@@ -1642,7 +1662,8 @@ int RunServe(std::span<const char* const> args) {
             .staging_capacity_bytes = cache_disk_staging_bytes,
             .model_artifact_fingerprint = {},
         },
-        vision_model_path, cache_ram, enable_yarn);
+        vision_model_path, cache_ram, enable_yarn, stream_experts,
+        expert_cache_bytes);
     loading.stop();
     if (!load_ok) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";

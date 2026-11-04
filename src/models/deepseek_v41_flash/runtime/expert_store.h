@@ -8,6 +8,7 @@
 struct ds41_expert_store;
 struct ds41_model;
 struct ds41_weights;
+struct ds41_expert_cache_status;
 
 struct ds41_expert_store_stats {
   uint64_t uses = 0;
@@ -128,6 +129,7 @@ void ds41_expert_store_trace_prediction(ds41_expert_store* store, uint32_t layer
 bool ds41_expert_store_prefetch_idle(const ds41_expert_store* store);
 ds41_expert_store_stats ds41_expert_store_get_stats(
     const ds41_expert_store* store);
+ds41_expert_cache_status ds41_expert_store_get_cache_status(const ds41_expert_store* store);
 void ds41_expert_store_log(const ds41_expert_store* store);
 
 #endif  // GUFO_MODELS_DEEPSEEK_V41_FLASH_RUNTIME_EXPERT_STORE_H_
