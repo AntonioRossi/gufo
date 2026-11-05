@@ -19,10 +19,10 @@ struct Execution {
   std::shared_ptr<Model> model;
 };
 
-class State final : public ext::TextRunnerState {
+class Slot final : public cache::Slot {
 public:
-  explicit State(std::shared_ptr<Execution> execution)
-      : execution_(std::move(execution)) {
+  Slot(std::shared_ptr<Execution> execution, cache::MutationGuard& guard)
+      : execution_(std::move(execution)), guard_(guard) {
     const std::lock_guard lock(execution_->mutex);
     std::string error;
     session_ = execution_->model->CreateSession(
@@ -46,20 +46,24 @@ public:
     }
   }
 
-  ~State() override {
+  ~Slot() override {
     const std::lock_guard lock(execution_->mutex);
     session_.reset();
   }
 
-  void SetCancellationCheck(const CancellationCheck& check) override {
+  bool IsValid() const noexcept override { return true; }
+
+  void SetCancellationCheck(
+      const ext::TextRunnerState::CancellationCheck& check) {
     const std::lock_guard lock(execution_->mutex);
     session_->SetCancellationCheck(check);
   }
 
-  void Invalidate() noexcept override {
+  void Invalidate() noexcept {
     const std::lock_guard lock(execution_->mutex);
     session_->SetCancellationCheck({});
     session_->Invalidate();
+    guard_.AfterReset();
   }
 
   Session& session() const { return *session_; }
@@ -67,7 +71,116 @@ public:
 
 private:
   std::shared_ptr<Execution> execution_;
+  cache::MutationGuard& guard_;
   std::unique_ptr<Session> session_;
+};
+
+// V4.1 has no prompt-cache components. The adapter owns the execution slot
+// and rejects all capture and restore operations.
+class Adapter final : public cache::Adapter {
+public:
+  explicit Adapter(std::shared_ptr<Execution> execution)
+      : execution_(std::move(execution)) {}
+
+  cache::Capabilities GetCapabilities() const override { return {}; }
+  std::span<const cache::ComponentDescriptor> Components() const override {
+    return {};
+  }
+  cache::Identity CompatibilityIdentity() const override {
+    const auto address = reinterpret_cast<std::uintptr_t>(execution_.get());
+    const auto* bytes = reinterpret_cast<const std::uint8_t*>(&address);
+    return {bytes, bytes + sizeof(address)};
+  }
+  std::unique_ptr<cache::Slot> CreateSlot(
+      cache::MutationGuard& guard) override {
+    return std::make_unique<Slot>(execution_, guard);
+  }
+  std::vector<cache::ComponentPosition> Positions(
+      const cache::Slot&) const override {
+    return {};
+  }
+  std::vector<cache::Rows> PlanPrefill(const cache::Slot& slot,
+                                       cache::Rows first,
+                                       cache::Rows end) const override {
+    const auto& native = RequireSlot(slot);
+    const auto capacity = native.session().PrefillCapacity();
+    std::vector<cache::Rows> boundaries;
+    while (first < end) {
+      first += std::min<cache::Rows>(capacity, end - first);
+      boundaries.push_back(first);
+    }
+    return boundaries;
+  }
+  void BeginRestore(cache::Slot&,
+                    std::span<const cache::ComponentPosition>) override {
+    Unsupported();
+  }
+  cache::Completion CapturePrivate(const cache::Slot&, cache::ComponentId,
+                                   std::span<std::byte>,
+                                   cache::Stream&) override {
+    Unsupported();
+  }
+  cache::Completion CopyRowsOut(const cache::Slot&, cache::ComponentId,
+                                cache::Rows, cache::Rows, std::span<std::byte>,
+                                cache::Stream&) override {
+    Unsupported();
+  }
+  cache::Completion CopyRowsIn(cache::Slot&, cache::ComponentId, cache::Rows,
+                               cache::Rows, std::span<const std::byte>,
+                               cache::Stream&) override {
+    Unsupported();
+  }
+  cache::Completion LoadPrivate(cache::Slot&, cache::ComponentId,
+                                std::span<const std::byte>,
+                                cache::Stream&) override {
+    Unsupported();
+  }
+  bool Validate(cache::Slot&,
+                std::span<const cache::ComponentPosition>) override {
+    Unsupported();
+  }
+  bool Invalidate(cache::Slot& slot) noexcept override {
+    auto* native = dynamic_cast<Slot*>(&slot);
+    if (!native || native->execution() != execution_.get())
+      return false;
+    native->Invalidate();
+    return true;
+  }
+
+  const Slot& RequireSlot(const cache::Slot& slot) const {
+    const auto* native = dynamic_cast<const Slot*>(&slot);
+    if (!native || native->execution() != execution_.get())
+      throw std::invalid_argument(
+          "DeepSeek V4.1 slot belongs to another runner");
+    return *native;
+  }
+
+private:
+  [[noreturn]] static void Unsupported() {
+    throw std::logic_error("DeepSeek V4.1 prompt caching is not supported");
+  }
+  std::shared_ptr<Execution> execution_;
+};
+
+class State final : public ext::TextRunnerState {
+public:
+  explicit State(Slot& slot) : slot_(slot) {}
+  void SetCancellationCheck(const CancellationCheck& check) override {
+    slot_.SetCancellationCheck(check);
+  }
+  void Invalidate() noexcept override { slot_.Invalidate(); }
+  Session& session() const { return slot_.session(); }
+  const Execution* execution() const { return slot_.execution(); }
+
+private:
+  Slot& slot_;
+};
+
+class Stream final : public cache::Stream {
+public:
+  cache::TransferResult Synchronize() noexcept override {
+    return cache::TransferResult::kSucceeded;
+  }
 };
 
 std::vector<TextRunnerToken> RunnerTokens(std::span<const int> tokens) {
@@ -97,17 +210,16 @@ public:
             .state_abi = "deepseek-v41-flash-1017-ar-v1",
             .max_context = execution_->model->MaxContext(),
             .capabilities = {.incremental_prefill = true,
-                             .snapshot = false,
-                             .fork = false,
                              .final_token_advance_required = false,
                              .incremental_text_is_exact = true,
                              .prefix_reuse = false},
-            .persistence = std::nullopt,
             .sampling_preset = sampling::TextModelPreset::kDeepSeekV41Flash};
   }
 
   ext::TextRunnerResourceClaim ResourceClaim() const override {
     ext::TextRunnerResourceClaim claim;
+    claim.retained_snapshot_capacity_bytes = 0;
+    claim.retained_snapshot_ceiling_bytes = ext::HostSnapshotCeilingBytes();
     claim.requires_device_runtime_lock = true;
     return claim;
   }
@@ -165,8 +277,29 @@ public:
     return text;
   }
 
-  std::unique_ptr<ext::TextRunnerState> CreateState() const override {
-    return std::make_unique<State>(execution_);
+  std::unique_ptr<ext::ComponentCacheResources> CreateComponentCacheResources(
+      cache::ResourceLedger&, std::size_t) const override {
+    auto resources = std::make_unique<ext::ComponentCacheResources>();
+    resources->adapter = std::make_unique<Adapter>(execution_);
+    resources->stream = [] { return std::make_unique<Stream>(); };
+    return resources;
+  }
+
+  std::unique_ptr<ext::TextRunnerState> BindComponentState(
+      cache::Adapter& adapter, cache::Slot& slot) const override {
+    const auto& native = dynamic_cast<Adapter&>(adapter).RequireSlot(slot);
+    if (native.execution() != execution_.get())
+      throw std::invalid_argument(
+          "DeepSeek V4.1 slot belongs to another runner");
+    return std::make_unique<State>(dynamic_cast<Slot&>(slot));
+  }
+
+  void ReconcileComponentState(ext::TextRunnerState& state,
+                               std::size_t position) const override {
+    const std::lock_guard lock(execution_->mutex);
+    if (position !=
+        static_cast<std::size_t>(RequireState(state).session().Position()))
+      throw std::invalid_argument("DeepSeek V4.1 cache position is invalid");
   }
 
   ext::TextPrefillStep Prefill(ext::TextRunnerState& state,

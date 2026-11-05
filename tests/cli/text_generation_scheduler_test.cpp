@@ -21,6 +21,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -33,6 +34,8 @@
 #include "src/core/json.hpp"
 #include "src/core/platform/env.hpp"
 #include "src/core/platform/os_info.hpp"
+#include "tests/cache/fake_adapter.hpp"
+#include "tests/cli/fake_cache_resources.hpp"
 
 namespace {
 
@@ -115,6 +118,7 @@ struct Event {
 struct FakeControl {
   gufo::sampling::TextModelPreset sampling_preset{
       gufo::sampling::TextModelPreset::kUnspecified};
+  std::optional<gufo::sampling::TextSamplingDefaults> sampling_defaults;
   void Log(Event event) {
     const std::lock_guard<std::mutex> lock(mutex);
     events.push_back(event);
@@ -217,27 +221,67 @@ struct FakeControl {
   std::uint32_t max_context{128};
   std::optional<std::size_t> stop_after;
   std::optional<std::size_t> eos_after;
+  // Requests share nothing unless asked; a capture observer implies it.
+  bool snapshots{false};
   std::function<void()> snapshot_callback;
+  [[nodiscard]] bool Retains() const {
+    return snapshots || bool(snapshot_callback);
+  }
 };
 
-class FakeState final : public TextRunnerState {
-public:
-  explicit FakeState(std::shared_ptr<FakeControl> control)
-      : control_(std::move(control)) {}
-
-  void Invalidate() noexcept override {
-    control_->RecordInvalidation();
-    label = 0;
-    position = 0;
-    decode_count = 0;
-    frontier.reset();
-  }
-
-  std::shared_ptr<FakeControl> control_;
+// What a checkpoint restores besides the adapter's rows.
+struct FakeFrontier {
   TextRunnerToken label{0};
   std::size_t position{0};
   std::size_t decode_count{0};
   std::optional<TextRunnerToken> frontier;
+};
+
+class ObservedAdapter final : public gufo::cache::testing::FakeAdapter {
+public:
+  explicit ObservedAdapter(std::shared_ptr<FakeControl> control)
+      : FakeAdapter(64), control_(std::move(control)) {}
+  std::unique_ptr<gufo::cache::Slot> CreateSlot(
+      gufo::cache::MutationGuard& guard) override {
+    control_->states_created.fetch_add(1, std::memory_order_relaxed);
+    return FakeAdapter::CreateSlot(guard);
+  }
+  bool Invalidate(gufo::cache::Slot& slot) noexcept override {
+    // Assigning a cold slot also resets it; only discarded work counts.
+    bool executed = true;
+    try {
+      executed = Positions(slot).front().valid_rows != 0;
+    } catch (...) {
+    }
+    if (executed)
+      control_->RecordInvalidation();
+    return FakeAdapter::Invalidate(slot);
+  }
+  gufo::cache::Completion CapturePrivatePiece(
+      const gufo::cache::Slot& slot, gufo::cache::ComponentId id,
+      std::size_t offset, std::span<std::byte> bytes,
+      gufo::cache::Stream& stream) override {
+    if (offset == 0 && control_->snapshot_callback)
+      control_->snapshot_callback();
+    return FakeAdapter::CapturePrivatePiece(slot, id, offset, bytes, stream);
+  }
+
+private:
+  std::shared_ptr<FakeControl> control_;
+};
+
+class FakeState final : public TextRunnerState, public FakeFrontier {
+public:
+  FakeState(gufo::cache::testing::FakeAdapter& adapter, gufo::cache::Slot& slot)
+      : adapter(adapter), slot(slot) {}
+
+  void Invalidate() noexcept override {
+    (void)adapter.Invalidate(slot);
+    static_cast<FakeFrontier&>(*this) = {};
+  }
+
+  gufo::cache::testing::FakeAdapter& adapter;
+  gufo::cache::Slot& slot;
 };
 
 FakeState& RequireFakeState(TextRunnerState& state) {
@@ -269,8 +313,6 @@ public:
         .capabilities =
             TextRunnerCapabilities{
                 .incremental_prefill = control_->incremental_prefill,
-                .snapshot = bool(control_->snapshot_callback),
-                .fork = bool(control_->snapshot_callback),
                 .final_token_advance_required =
                     control_->final_token_advance_required,
                 .incremental_text_is_exact =
@@ -279,9 +321,9 @@ public:
                 .batched_multi_token_decode =
                     control_->batched_multi_token_decode,
                 .batched_multi_token_decode_max_width = 4,
-                .prefix_reuse = control_->prefix_reuse,
+                .prefix_reuse = control_->prefix_reuse && control_->Retains(),
             },
-        .persistence = std::nullopt,
+        .sampling_defaults = control_->sampling_defaults,
         .sampling_preset = control_->sampling_preset,
     };
   }
@@ -292,8 +334,7 @@ public:
         .state_capacity_bytes = 8 * 64,
         .per_request_state_bytes = 64,
         .temporary_scratch_bytes = 0,
-        .retained_snapshot_capacity_bytes =
-            control_->snapshot_callback ? 4096U : 0U,
+        .retained_snapshot_capacity_bytes = 1U << 25,
         .requires_device_runtime_lock = true,
     };
   }
@@ -353,9 +394,25 @@ public:
     return text;
   }
 
-  [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
-    control_->states_created.fetch_add(1, std::memory_order_relaxed);
-    return std::make_unique<FakeState>(control_);
+  [[nodiscard]] std::unique_ptr<gufo::server::ComponentCacheResources>
+  CreateComponentCacheResources(gufo::cache::ResourceLedger& ledger,
+                                std::size_t) const override {
+    return gufo::server::testing::MakeFakeCacheResources(
+        ledger, std::make_unique<ObservedAdapter>(control_),
+        {.private_blocks = 512,
+         .row_backing_bytes = 1024,
+         .total_row_bytes = 1U << 24});
+  }
+  [[nodiscard]] std::unique_ptr<TextRunnerState> BindComponentState(
+      gufo::cache::Adapter& adapter, gufo::cache::Slot& slot) const override {
+    auto state = std::make_unique<FakeState>(
+        dynamic_cast<gufo::cache::testing::FakeAdapter&>(adapter), slot);
+    Recall(*state);
+    return state;
+  }
+  void ReconcileComponentState(TextRunnerState& state,
+                               std::size_t) const override {
+    Recall(RequireFakeState(state));
   }
 
   void PrepareBatchExecution(TextRunnerState& state) const override {
@@ -395,11 +452,14 @@ public:
       }
     }
 
+    const auto rows = prompt.subspan(offset, consumed);
+    fake.adapter.Append(fake.slot, rows, rows);
     fake.position += consumed;
     const bool ready = fake.position == prompt.size();
     if (ready) {
       fake.frontier = fake.label * 100;
     }
+    Remember(fake);
     return {
         .consumed_tokens = consumed,
         .decode_ready = ready,
@@ -447,39 +507,6 @@ public:
     return SelectNext(state, sampler);
   }
 
-  struct SnapshotState final : gufo::server::TextRunnerSnapshot {
-    explicit SnapshotState(const FakeState& state)
-        : label(state.label),
-          position(state.position),
-          decode_count(state.decode_count),
-          frontier(state.frontier) {}
-    TextRunnerToken label;
-    std::size_t position, decode_count;
-    std::optional<TextRunnerToken> frontier;
-    std::size_t PayloadBytes() const noexcept override {
-      return sizeof(SnapshotState);
-    }
-  };
-  std::size_t SnapshotPayloadBytes(const TextRunnerState&) const override {
-    return sizeof(SnapshotState);
-  }
-  std::unique_ptr<gufo::server::TextRunnerSnapshot> Snapshot(
-      const TextRunnerState& state) const override {
-    if (control_->snapshot_callback)
-      control_->snapshot_callback();
-    return std::make_unique<SnapshotState>(RequireFakeState(state));
-  }
-  void RestoreOrFork(
-      TextRunnerState& state,
-      const gufo::server::TextRunnerSnapshot& snapshot) const override {
-    auto& restored = RequireFakeState(state);
-    const auto& saved = dynamic_cast<const SnapshotState&>(snapshot);
-    restored.label = saved.label;
-    restored.position = saved.position;
-    restored.decode_count = saved.decode_count;
-    restored.frontier = saved.frontier;
-  }
-
   void Advance(TextRunnerState& state, TextRunnerToken token) const override {
     const auto started = std::chrono::steady_clock::now();
     auto& fake = RequireFakeState(state);
@@ -511,9 +538,11 @@ public:
       });
     }
 
+    fake.adapter.Append(fake.slot, {&token, 1}, {&token, 1});
     ++fake.position;
     ++fake.decode_count;
     fake.frontier = token + 1;
+    Remember(fake);
     if (fake.label == 1)
       control_->first_request_advance_ns.fetch_add(
           std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -594,7 +623,19 @@ public:
   }
 
 private:
+  void Remember(const FakeState& state) const {
+    const std::lock_guard lock(frontier_mutex_);
+    frontiers_[state.adapter.RecurrentHash(state.slot)] = state;
+  }
+  void Recall(FakeState& state) const {
+    const std::lock_guard lock(frontier_mutex_);
+    const auto found = frontiers_.find(state.adapter.RecurrentHash(state.slot));
+    static_cast<FakeFrontier&>(state) =
+        found == frontiers_.end() ? FakeFrontier{} : found->second;
+  }
   std::shared_ptr<FakeControl> control_;
+  mutable std::mutex frontier_mutex_;
+  mutable std::unordered_map<std::uint64_t, FakeFrontier> frontiers_;
 };
 
 std::unique_ptr<TextGenerationScheduler> MakeScheduler(
@@ -773,7 +814,7 @@ void TestParkedFollowerSurvivesLeaderCancellation() {
   }
 }
 
-void TestSharedPrefixWaitRequiresSnapshots() {
+void TestSharedPrefixWaitRequiresPrefixReuse() {
   auto control = SharedPrefixControl(false);
   control->block_prefill_label = 1;
   auto scheduler = MakeScheduler(control, 2);
@@ -786,7 +827,7 @@ void TestSharedPrefixWaitRequiresSnapshots() {
   const auto b = follower.Wait();
   Expect(b.tokens == ExpectedTokens(1, 2) && b.shared_prefix_wait_ms == 0.0 &&
              b.prefill_tokens == prompt.size(),
-         "runners without snapshots never park concurrent requests");
+         "runners without prefix reuse never park concurrent requests");
 }
 
 void TestParkedFollowersReserveVisibleSessions() {
@@ -1052,6 +1093,7 @@ void TestRequestTotalsDoNotNeedAConsumer() {
       };
   {
     auto control = std::make_shared<FakeControl>();
+    control->snapshots = true;
     auto scheduler = MakeScheduler(control, 1);
     gufo::server::RecordServerMetrics(
         scheduler->Submit({1, 10}, 1, 0.0F).Wait());
@@ -1365,13 +1407,16 @@ void TestPrefillYieldsToEveryDueDecoder(bool multi_token, bool batched) {
   control->multi_token_decode = multi_token;
   control->batched_multi_token_decode = batched;
   control->supports_batched_advance = multi_token;
-  control->block_advance_label = 2;
+  control->block_advance_label = 1;
   auto scheduler = MakeScheduler(control, 3, {.decode_active_tokens = 2});
 
   const std::size_t output_tokens = multi_token ? 30 : 10;
   auto request_a = scheduler->Submit({1}, output_tokens, 0.0F);
+  // Hold A before it can finish while the submitting thread is descheduled.
+  // Queue both peers before releasing it, so both decoders are still due
+  // between C's prefill chunks, regardless of host scheduling.
+  control->WaitForAdvance(1);
   auto request_b = scheduler->Submit({2}, output_tokens, 0.0F);
-  control->WaitForAdvance(2);
   auto request_c = scheduler->Submit({3, 30, 31, 32, 33, 34, 35}, 2, 0.0F);
   control->ReleaseAdvance();
 
@@ -1842,7 +1887,9 @@ void TestMetricsDuringCacheAdmission() {
         release.acquire();
       }
     };
-    auto scheduler = MakeScheduler(control, 2);
+    // Capture does not hold admission: only the full slot keeps the peer
+    // queued.
+    auto scheduler = MakeScheduler(control, 1);
     const auto first = scheduler->Submit({1, 10}, 1, 0.0F).Wait();
     Expect(first.tokens == ExpectedTokens(1, 1), "first request completes");
     Expect(metrics::RequestsProcessing().load() == processing_before,
@@ -2794,6 +2841,7 @@ void TestPromptProgressPrecedesStreamedTokens() {
   using gufo::server::TextGenerationBackend;
   auto control = std::make_shared<FakeControl>();
   control->prefill_capacity = 2;
+  control->snapshots = true;
   auto scheduler = MakeScheduler(control, 1);
   auto run = [&](std::vector<TextRunnerToken> prompt, bool stream,
                  bool report_progress = true) {
@@ -3088,7 +3136,8 @@ void TestBackendPreservesModelSamplingPreset() {
     gufo::server::InferenceBackend backend;
     std::string error;
     Expect(backend.load(std::make_shared<FakeRunner>(control), &error), error);
-    Expect(backend.sampling_defaults().model == preset,
+    Expect(backend.sampling_defaults().provider ==
+               gufo::sampling::PresetDefaults(preset),
            "loading an extension preserves its sampling preset");
     for (const bool thinking : {false, true}) {
       const auto defaults = backend.sampling_defaults().Resolve(thinking);
@@ -3104,17 +3153,30 @@ void TestBackendPreservesModelSamplingPreset() {
     configured.temperature = 0.25F;
     backend.set_sampling_defaults(32, configured, {.temperature = true});
     const auto defaults = backend.sampling_defaults();
-    Expect(defaults.model == preset && defaults.max_tokens == 32 &&
+    Expect(defaults.provider == gufo::sampling::PresetDefaults(preset) &&
+               defaults.max_tokens == 32 &&
                defaults.Resolve(true).temperature == 0.25F &&
                defaults.Resolve(true).top_p == 0.95F,
            "server overrides retain the model preset for omitted fields");
   }
+}
+
+void TestBackendRejectsInvalidSamplingDefaults() {
+  auto control = std::make_shared<FakeControl>();
+  control->sampling_defaults.emplace();
+  control->sampling_defaults->thinking_disabled.temperature = -1.0F;
+  gufo::server::InferenceBackend backend;
+  std::string error;
+  Expect(!backend.load(std::make_shared<FakeRunner>(control), &error) &&
+             !error.empty(),
+         "invalid provider sampling defaults fail model load");
 }
 #endif
 
 int main() {
 #if defined(ENGINE_ENABLE_HIP)
   TestBackendPreservesModelSamplingPreset();
+  TestBackendRejectsInvalidSamplingDefaults();
 #endif
   TestTokenLogprobs();
   TestPublicationWaitUsesRecentSubstantialPrefill();
@@ -3184,7 +3246,7 @@ int main() {
   TestConcurrentSharedPrefixesPrefillOnce();
   TestLeaderCancelledBeforeFollowerIsAdmitted();
   TestParkedFollowerSurvivesLeaderCancellation();
-  TestSharedPrefixWaitRequiresSnapshots();
+  TestSharedPrefixWaitRequiresPrefixReuse();
   TestParkedFollowersReserveVisibleSessions();
   TestRetainedHistoryBeatsSharedPrefixWait();
   TestAwaitedCheckpointSurvivesCachePressure();

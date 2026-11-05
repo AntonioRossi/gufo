@@ -11,6 +11,14 @@ namespace {
 
 constexpr std::uint32_t kDefaultContext = 4096;
 
+// The CLI slot has no cache components or readers.
+class SlotGuard final : public cache::MutationGuard {
+public:
+  void BeforeOverwrite(cache::ComponentId, cache::Rows, cache::Rows) override {}
+  void BeforeRelease(cache::ComponentId, cache::Rows,
+                     cache::Rows) noexcept override {}
+};
+
 ReasoningEffort ParseReasoningEffort(std::string_view value) {
   if (value == "minimal")
     return ReasoningEffort::kMinimal;
@@ -109,7 +117,11 @@ std::string Generate(const ext::TextPromptOptions& options,
       options.max_tokens >= descriptor.max_context - tokens.size())
     throw std::invalid_argument(
         "DeepSeek V4.1 prompt and output exceed the CLI context");
-  auto state = runner.CreateState();
+  cache::ResourceLedger ledger({});
+  auto resources = runner.CreateComponentCacheResources(ledger, 0);
+  SlotGuard guard;
+  auto slot = resources->adapter->CreateSlot(guard);
+  auto state = runner.BindComponentState(*resources->adapter, *slot);
   for (std::size_t offset = 0; offset < tokens.size();) {
     const auto step =
         runner.Prefill(*state, tokens, offset, tokens.size() - offset);

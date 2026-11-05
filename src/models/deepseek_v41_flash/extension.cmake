@@ -89,6 +89,7 @@ gufo_extension_target(
     gufo_deepseek_v41_flash_mmq
     gufo_core
     gufo_logging
+    gufo_ext_cache
     hip::host
     roc::hipblas
     roc::hipblaslt
