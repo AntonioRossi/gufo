@@ -5,6 +5,10 @@
 #include <cstdint>
 #include <vector>
 
+#include "variant.h"
+
+DS41_NAMESPACE_BEGIN
+
 struct ds41_tokens {
   int* v;
   int len;
@@ -237,6 +241,9 @@ void ds41_session_snapshot_free(ds41_session_snapshot* snapshot);
 void ds41_session_set_cancel(ds41_session* session,
                              ds41_session_cancel_fn callback, void* user_data);
 void ds41_session_invalidate(ds41_session* session);
+/* Clears tokens, decoder position, drafter and lookup state, and the
+ * cancellation callback. Allocated buffers remain. Use before slot reuse. */
+void ds41_session_reset(ds41_session* session);
 int ds41_session_pos(const ds41_session* session);
 int ds41_session_ctx(const ds41_session* session);
 uint32_t ds41_session_prefill_capacity(const ds41_session* session);
@@ -374,5 +381,7 @@ uint64_t ds41_dspark_ring_bytes(void);
 void* ds41_session_dspark_ring(ds41_session* session, uint64_t* bytes);
 int ds41_session_dspark_range(const ds41_session* session, uint32_t* start, uint32_t* end);
 int ds41_session_dspark_set_range(ds41_session* session, uint32_t start, uint32_t end);
+
+DS41_NAMESPACE_END
 
 #endif  // GUFO_MODELS_DEEPSEEK_V41_FLASH_RUNTIME_MODEL_H_

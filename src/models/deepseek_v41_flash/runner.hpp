@@ -2,7 +2,9 @@
 
 #include <gufo/ext/text.hpp>
 
-namespace gufo::models::deepseek_v41_flash {
+#include "src/models/deepseek_v41_flash/runtime/variant.h"
+
+namespace DS41_VARIANT_NAMESPACE {
 
 std::shared_ptr<ext::TextModelRunner> CreateDeepSeekTextRunner(
     const ext::TextRunnerOptions& options, std::string* error);
@@ -18,4 +20,4 @@ int RunDeepSeekChat(const ext::TextPromptOptions& options,
                     const core::GgufReader& reader,
                     std::chrono::steady_clock::time_point load_start);
 
-}  // namespace gufo::models::deepseek_v41_flash
+}  // namespace DS41_VARIANT_NAMESPACE

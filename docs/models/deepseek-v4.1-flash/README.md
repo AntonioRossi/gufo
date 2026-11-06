@@ -5,23 +5,28 @@ This document is a port summary. The
 describes the source fork at `01fb6f4e39464003efffd97d79607005146280f0`.
 Its optional functions exceed this port's scope.
 
-The `deepseek41` provider supports text through `prompt`, `chat`, and the
-HTTP text interface. This first port targets Linux x86-64 and AMD `gfx1151`.
-Use one session and serial execution. The selected check mode streams
-routed experts from SSD with `--stream-experts --expert-cache-bytes 68719476736`.
-The source runtime keeps dense weights resident. The cache value is an
-upper limit of 64 GiB; the cache can be smaller after session allocation.
-The adapter calls `Model::FitExpertCache` after that allocation and reports
-the requested limit and actual cache through `event=expert_streaming`.
-Without the options, the runtime retains its resident default.
-The imported loader reads Engram data from the SSD.
+The extension has two `deepseek41` variants in one executable. The 384-expert
+IQ1_M variant uses one serial session. The 192-expert Coder variant uses one
+through eight sessions in AR or DSpark. Both variants target Linux x86-64 and
+AMD `gfx1151`, and both use the `prompt`, `chat`, and HTTP text interfaces.
+Select 1 to 8 sessions with `--sessions N` or `-j N`; the default remains one.
 
-The selected artifact is ISTA GSQ-RCO `IQ1_M` at revision
-`65d53bc8be65123e255ff02f3ded958b6dbf54fd`. Give the first shard path to the
-engine. The filename must end with `-00001-of-00006.gguf`. All six split
-positions must be present. The sixth position is the shared `IQ4_NL`
-Engram file under the matching shard-6 name. The bundle contains several
-expert types; `IQ1_M` is not the only type.
+The selected 384 artifact is ISTA GSQ-RCO `IQ1_M` at revision
+`65d53bc8be65123e255ff02f3ded958b6dbf54fd`. The Coder artifact is ISTA GSQ-RCO
+`IQ2_XXS` at local revision `54229d38d588a66d1c6cff08af7b281b9326c656`.
+Give the first shard path to the engine. The filename must end with
+`-00001-of-00006.gguf`. All six split positions must be present. The sixth
+position is the shared `IQ4_NL` Engram file under the matching shard-6 name.
+The bundles contain several routed expert types; neither is uniform.
+
+The selected check mode streams routed experts from SSD with
+`--stream-experts --expert-cache-bytes 68719476736` for the 384 variant.
+The source runtime keeps dense weights resident. The cache value is an
+upper limit; the cache can be smaller after session allocation. The adapter
+allocates every selected session and its long-lived buffers before
+`Model::FitExpertCache`, then reports the requested limit and actual cache
+through `event=expert_streaming`. Without the options, the runtime retains
+its resident default. The imported loader reads Engram data from the SSD.
 
 The HTTP interface supports function tools, assistant tool-call history,
 and tool results. It uses the source V4.1 DSML grammar and scanner.
@@ -35,10 +40,12 @@ tool-delta path. Schema enforcement has the same strict and non-strict
 limits as the source grammar. The client executes the tools and returns
 their results; the model server does not execute them.
 
-The adapter rejects vision, speculative decoding, and explicit
-prompt-cache settings. It does not expose request batching.
-Prefix reuse, snapshots, and persistent prompt caching are
-unavailable. Each CLI chat turn creates a new session.
+The adapter rejects vision and explicit prompt-cache settings. The 384
+variant also rejects speculative decoding and request batching. The Coder
+accepts `--speculative dspark` with `--dspark-model`; its sessions are
+speculative and its AR requests can use batch widths 2 through 8. Prefix
+reuse, snapshots, and persistent prompt caching are unavailable. Each CLI
+chat turn resets the pooled session before the new prompt.
 
 The imported decoder keeps native YaRN. The `--enable-yarn` option is
 unsupported; that option selects additional context scaling for Qwen.

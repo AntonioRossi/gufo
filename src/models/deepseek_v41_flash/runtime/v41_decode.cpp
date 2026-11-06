@@ -32,6 +32,8 @@
 #include "tensor_types.h"
 #include "v41_dspark.h"
 
+DS41_NAMESPACE_BEGIN
+
 namespace {
 
 constexpr uint32_t kHc = DS41_N_HC;
@@ -2470,3 +2472,5 @@ bool ds41_decoder_embed(const ds41_decoder* d, const int* tokens, uint32_t n, fl
 }
 
 const float* ds41_decoder_freq_plain(const ds41_decoder* d) { return d->freq_plain; }
+
+DS41_NAMESPACE_END

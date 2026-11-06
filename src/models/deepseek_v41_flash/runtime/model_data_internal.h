@@ -7,6 +7,10 @@
 #include "model.h"
 #include "tensor_types.h"
 
+#include "variant.h"
+
+DS41_NAMESPACE_BEGIN
+
 inline constexpr float DS41_NEG_INF = -1.0e30F;
 inline constexpr float DS41_POS_INF = 1.0e30F;
 
@@ -23,7 +27,7 @@ inline constexpr uint32_t DS41_N_ROT = 64;
 inline constexpr uint32_t DS41_N_OUT_GROUP = 8;
 inline constexpr uint32_t DS41_N_LORA_Q = 1280;
 inline constexpr uint32_t DS41_N_LORA_O = 1024;
-inline constexpr uint32_t DS41_N_EXPERT = 384;
+inline constexpr uint32_t DS41_N_EXPERT = DS41_VARIANT_EXPERT_COUNT;
 inline constexpr uint32_t DS41_N_EXPERT_USED = 6;
 inline constexpr uint32_t DS41_N_EXPERT_SHARED = 1;
 inline constexpr uint32_t DS41_N_FF_EXP = 2304;
@@ -63,7 +67,6 @@ inline constexpr uint32_t DS41_ENGRAM_COLS =
 inline constexpr uint32_t DS41_ENGRAM_COMPRESSED_VOCAB = 99092;
 inline constexpr uint32_t DS41_ENGRAM_PAD_TOKEN = 2;
 
-inline constexpr char DS41_MODEL_SHAPE_NAME[] = "DeepSeek V4.1 Flash";
 inline constexpr float DS41_RMS_EPS = 1.0e-20F;
 inline constexpr float DS41_HC_EPS = 1.0e-6F;
 inline constexpr float DS41_EXPERT_WEIGHT_SCALE = 1.5F;
@@ -198,5 +201,7 @@ double ds41_now_seconds(void);
 uint64_t ds41_align_up(uint64_t value, uint64_t alignment);
 const char* ds41_tensor_type_name(uint32_t type);
 uint64_t ds41_routed_expert_row_bytes(const ds41_tensor* tensor);
+
+DS41_NAMESPACE_END
 
 #endif  // GUFO_MODELS_DEEPSEEK_V41_FLASH_RUNTIME_MODEL_DATA_INTERNAL_H_

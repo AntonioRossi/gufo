@@ -16,6 +16,8 @@
 #include "native_internal.h"
 #include "tensor_types.h"
 
+DS41_NAMESPACE_BEGIN
+
 namespace {
 
 constexpr uint32_t kHc = DS41_N_HC;
@@ -720,3 +722,5 @@ bool ds41_dspark_copy_logits(const ds41_engine* engine, float* out, uint32_t row
          hipMemcpy(out, m->scratch->logits + (uint64_t)row0 * DS41_N_VOCAB, (uint64_t)rows * DS41_N_VOCAB * sizeof(float),
                    hipMemcpyDeviceToHost) == hipSuccess;
 }
+
+DS41_NAMESPACE_END

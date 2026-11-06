@@ -3,7 +3,7 @@
 #include <cmath>
 #include <limits>
 
-#include "native_internal.h"
+#include "sampling_api.h"
 
 int ds41_sample_argmax(const float* logits, uint32_t vocabulary_size) {
   if (logits == nullptr)

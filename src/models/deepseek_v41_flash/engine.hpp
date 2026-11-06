@@ -14,7 +14,7 @@
 #include "src/models/deepseek_v41_flash/chat_template.hpp"
 #include "src/models/deepseek_v41_flash/runtime/model.h"
 
-namespace gufo::models::deepseek_v41_flash {
+namespace DS41_VARIANT_NAMESPACE {
 
 struct ModelOptions {
   std::uint32_t max_context = 4096;
@@ -191,6 +191,9 @@ public:
                                      std::string* error_msg = nullptr);
   void SetCancellationCheck(CancellationCheck is_cancelled);
   void Invalidate() noexcept;
+  /// Clears request state and decoder position before slot reuse. The
+  /// allocation stays.
+  void ResetForReuse();
 
   [[nodiscard]] int Position() const;
   [[nodiscard]] int ContextSize() const;
@@ -229,6 +232,6 @@ private:
   friend class Session;
 };
 
-}  // namespace gufo::models::deepseek_v41_flash
+}  // namespace DS41_VARIANT_NAMESPACE
 
 #endif  // GUFO_MODELS_DEEPSEEK_V41_FLASH_ENGINE_HPP_

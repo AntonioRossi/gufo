@@ -20,6 +20,12 @@
 #include "src/models/deepseek_v41_flash/runtime/model.h"
 #include "src/models/deepseek_v41_flash/runtime/v41_dspark.h"
 
+#if DS41_VARIANT_CODER
+using namespace gufo::models::deepseek_v41_flash::coder;
+#else
+using namespace gufo::models::deepseek_v41_flash::v384;
+#endif
+
 namespace {
 using gufo::tests::ds41::ProbeStages;
 using gufo::tests::ds41::Stage;

@@ -6,6 +6,10 @@
 
 #include "model.h"
 
+#include "variant.h"
+
+DS41_NAMESPACE_BEGIN
+
 struct ds41_dspark_model;
 struct ds41_engram_tables;
 struct ds41_expert_store;
@@ -59,9 +63,6 @@ void ds41_tokens_copy(ds41_tokens* destination, const ds41_tokens* source);
 bool ds41_tokens_starts_with(const ds41_tokens* tokens,
                              const ds41_tokens* prefix);
 
-int ds41_sample_argmax(const float* logits, uint32_t vocabulary_size);
-int ds41_sample_top_p_min_p(const float* logits, uint32_t vocabulary_size,
-                            float temperature, int top_k, float top_p,
-                            float min_p, uint64_t* rng_state);
+DS41_NAMESPACE_END
 
 #endif  // GUFO_MODELS_DEEPSEEK_V41_FLASH_RUNTIME_NATIVE_INTERNAL_H_

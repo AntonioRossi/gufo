@@ -21,12 +21,11 @@
 #include "ds41_v41.h"
 #include "model.h"
 #include "native_internal.h"
+#include "sampling_api.h"
 #include <gufo/ext/prompt_lookup.hpp>
 #include "v41_dspark.h"
 
-int ds41_sample_argmax(const float* logits, uint32_t vocabulary_size);
-int ds41_sample_top_p_min_p(const float* logits, uint32_t vocabulary_size, float temperature, int top_k,
-                            float top_p, float min_p, uint64_t* rng_state);
+DS41_NAMESPACE_BEGIN
 
 struct ds41_session {
   ds41_engine* engine = nullptr;
@@ -147,6 +146,35 @@ bool eval(ds41_session* s, const int* tokens, uint32_t n, char* error, size_t ca
     set_error(error, capacity, "DSpark feature injection failed");
     s->valid = false;
     return false;
+  }
+  return true;
+}
+
+bool validate_ar_batch(const ds41_session_batch_item* items, size_t count,
+                       char* error, size_t capacity) {
+  if (!items || count == 0 || count > 8) {
+    set_error(error, capacity, "invalid AR batch size");
+    return false;
+  }
+  const ds41_session* lead = items[0].session;
+  if (!lead || !lead->engine || !lead->decoder) {
+    set_error(error, capacity, "invalid AR batch session");
+    return false;
+  }
+  for (size_t i = 0; i < count; i++) {
+    const ds41_session* s = items[i].session;
+    if (!s || !s->engine || !s->decoder || !s->valid || s->next >= 0 ||
+        s->dspark || s->engine != lead->engine || s->context != lead->context ||
+        (int)(s->tokens.size() + 1) >= s->context ||
+        items[i].token < 0 || items[i].token >= (int)vocab(s)) {
+      set_error(error, capacity, "invalid AR batch item");
+      return false;
+    }
+    for (size_t j = 0; j < i; j++)
+      if (items[j].session == s || items[j].session->decoder == s->decoder) {
+        set_error(error, capacity, "AR batch contains a duplicate session");
+        return false;
+      }
   }
   return true;
 }
@@ -300,9 +328,62 @@ int ds41_session_eval(ds41_session* s, int token, char* error, size_t capacity) 
 }
 
 int ds41_sessions_eval_batch(const ds41_session_batch_item* items, size_t count, char* error, size_t capacity) {
+  if (count == 1) return ds41_session_eval(items[0].session, items[0].token, error, capacity);
+  if (!validate_ar_batch(items, count, error, capacity)) return 1;
+
+  for (size_t i = 0; i < count; i++)
+    if (cancelled(items[i].session)) {
+      set_error(error, capacity, "AR batch cancelled");
+      return DS41_SESSION_SYNC_INTERRUPTED;
+    }
+
+  /* The write hooks run only after every item passed validation. */
   for (size_t i = 0; i < count; i++) {
-    if (ds41_session_eval(items[i].session, items[i].token, error, capacity) != 0) return 1;
+    ds41_session* s = items[i].session;
+    if (s->before_write) s->before_write(s->write_data, (uint32_t)s->tokens.size(),
+                                         (uint32_t)s->tokens.size() + 1);
   }
+
+  ds41_decoder* decoders[8] = {};
+  const int* tokens[8] = {};
+  uint32_t counts[8] = {};
+  int token_values[8] = {};
+  float* logits[8] = {};
+  for (size_t i = 0; i < count; i++) {
+    ds41_session* s = items[i].session;
+    token_values[i] = items[i].token;
+    decoders[i] = s->decoder;
+    tokens[i] = &token_values[i];
+    counts[i] = 1;
+    logits[i] = s->logits.data();
+  }
+
+  const int rc = ds41_decoder_eval_joint(decoders, tokens, counts, (uint32_t)count, logits, nullptr);
+  if (rc != 0) {
+    if (rc == 1) {
+      for (size_t i = 0; i < count; i++) ds41_session_invalidate(items[i].session);
+    }
+    set_error(error, capacity,
+              rc == 2 ? "joint AR batch is unsupported" : "joint AR evaluation failed");
+    return 1;
+  }
+
+  /* Commit only after every decoder's one-row verification succeeded. */
+  for (size_t i = 0; i < count; i++) {
+    if (ds41_decoder_commit(items[i].session->decoder, 1) != 0) {
+      for (size_t j = 0; j < count; j++) ds41_session_invalidate(items[j].session);
+      set_error(error, capacity, "joint AR commit failed");
+      return 1;
+    }
+  }
+
+  for (size_t i = 0; i < count; i++) {
+    ds41_session* s = items[i].session;
+    s->tokens.push_back(items[i].token);
+    s->valid = true;
+    s->next = -1;
+  }
+  fprintf(stderr, "ds41: event=ar_joint_batch width=%zu\n", count);
   return 0;
 }
 
@@ -944,6 +1025,13 @@ void ds41_session_invalidate(ds41_session* s) {
   if (s->dspark) ds41_dspark_state_reset(s->dspark, 0);
 }
 
+void ds41_session_reset(ds41_session* s) {
+  if (!s) return;
+  ds41_session_invalidate(s);
+  (void)ds41_decoder_reset(s->decoder);
+  ds41_session_set_cancel(s, nullptr, nullptr);
+}
+
 void ds41_session_set_write_hook(ds41_session* s, ds41_session_write_fn callback, void* user_data) {
   if (!s) return;
   s->before_write = callback;
@@ -1015,3 +1103,5 @@ uint64_t ds41_session_payload_bytes(const ds41_session* s) {
   return 4 * sizeof(uint64_t) + s->tokens.size() * sizeof(int) + s->logits.size() * sizeof(float) +
          ds41_decoder_state_bytes(s->decoder) + (s->dspark ? ds41_dspark_state_bytes(s->dspark) : 0);
 }
+
+DS41_NAMESPACE_END

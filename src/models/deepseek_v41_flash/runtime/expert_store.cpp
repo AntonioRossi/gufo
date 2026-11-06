@@ -38,6 +38,8 @@
 #include <gufo/ext/experimental/managed_alloc.hpp>
 #include <gufo/ext/platform/os_info.hpp>
 
+DS41_NAMESPACE_BEGIN
+
 namespace {
 
 constexpr uint64_t kGiB = 1ull << 30;
@@ -81,7 +83,11 @@ constexpr uint64_t kVictimsTicks = 512;
 constexpr uint64_t kTableEntries = uint64_t{DS41_N_LAYER} * DS41_N_EXPERT;
 constexpr uint32_t kNoLayer = std::numeric_limits<uint32_t>::max();
 constexpr std::array<uint16_t, DS41_N_LAYER * DS41_N_EXPERT> kDefaultExpertRank = {
+#if DS41_VARIANT_CODER
+#include "expert_rank_coder.inc"
+#else
 #include "expert_rank.inc"
+#endif
 };
 constexpr bool valid_default_rank() {
   std::array<bool, DS41_N_LAYER * DS41_N_EXPERT> seen{};
@@ -1950,3 +1956,5 @@ bool ds41_expert_store_set_reserve(ds41_expert_store* store,
   store->cache_limit = limit;
   return store->shrink_to(limit) && staged;
 }
+
+DS41_NAMESPACE_END

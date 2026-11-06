@@ -32,4 +32,15 @@ if(TARGET gufo_deepseek_v41_flash_hip)
 
   add_executable(ds41_load_probe EXCLUDE_FROM_ALL load_probe.cpp)
   target_link_libraries(ds41_load_probe PRIVATE gufo_deepseek_v41_flash_hip hip::host)
+
+  add_executable(ds41_load_probe_coder EXCLUDE_FROM_ALL load_probe.cpp)
+  target_link_libraries(ds41_load_probe_coder PRIVATE
+    gufo_deepseek_v41_flash_hip hip::host)
+  target_compile_definitions(ds41_load_probe_coder PRIVATE
+    DS41_VARIANT_CODER=1
+    DS41_VARIANT_NAMESPACE=gufo::models::deepseek_v41_flash::coder)
+
+  add_executable(ds41_probe_check EXCLUDE_FROM_ALL probe_check.cpp)
+  target_link_libraries(ds41_probe_check PRIVATE
+    gufo_deepseek_v41_flash gufo_core)
 endif()

@@ -6,7 +6,7 @@
 #include "src/models/deepseek_v41_flash/engine.hpp"
 #include "src/models/deepseek_v41_flash/runner.hpp"
 
-namespace gufo::models::deepseek_v41_flash {
+namespace DS41_VARIANT_NAMESPACE {
 namespace {
 
 constexpr std::uint32_t kDefaultContext = 4096;
@@ -60,17 +60,43 @@ std::shared_ptr<ext::TextModelRunner> LoadRunner(
   if (!options.vision_model_path.empty() || !options.image_paths.empty() ||
       options.add_vision_id)
     throw std::invalid_argument("DeepSeek V4.1 vision is not supported");
+#if DS41_VARIANT_CODER
+  const bool dspark = options.speculative_backend == "dspark";
+  if (!options.speculative_backend.empty() && !dspark)
+    throw std::invalid_argument(
+        "DeepSeek V4.1 supports only --speculative dspark");
+  if (dspark && options.dspark_model_path.empty())
+    throw std::invalid_argument("--speculative dspark requires --dspark-model");
+  if (dspark && options.min_draft_tokens != 1)
+    throw std::invalid_argument(
+        "DeepSeek V4.1 DSpark uses model-owned adaptive drafting");
+  if (!options.mtp_model_path.empty() || !options.dflash_model_path.empty() ||
+      !options.draft_policy.empty())
+    throw std::invalid_argument(
+        "DeepSeek V4.1 supports only DSpark speculative decoding");
+#else
   if (!options.speculative_backend.empty() || !options.mtp_model_path.empty() ||
       !options.dflash_model_path.empty() ||
       !options.dspark_model_path.empty() || !options.draft_policy.empty() ||
       options.draft_tokens != 7 || options.min_draft_tokens != 1)
     throw std::invalid_argument(
         "DeepSeek V4.1 speculative decoding is not supported");
+#endif
   ext::TextRunnerOptions runner_options;
   runner_options.model_path = options.model_path;
   runner_options.reader = std::shared_ptr<const core::GgufReader>(
       &reader, [](const core::GgufReader*) {});
   runner_options.max_context = kDefaultContext;
+  runner_options.session_count = 1;
+#if DS41_VARIANT_CODER
+  runner_options.speculative.backend =
+      dspark ? ext::TextSpeculativeBackend::kDSpark
+             : ext::TextSpeculativeBackend::kDisabled;
+  runner_options.speculative.draft_model_path =
+      dspark ? options.dspark_model_path : std::string{};
+  runner_options.speculative.max_draft_tokens = options.draft_tokens;
+  runner_options.speculative.min_draft_tokens = options.min_draft_tokens;
+#endif
   runner_options.stream_experts = options.stream_experts;
   runner_options.expert_cache_bytes = options.expert_cache_bytes;
   runner_options.ram_cache.enabled = false;
@@ -137,14 +163,34 @@ std::string Generate(const ext::TextPromptOptions& options,
     std::cerr << "Prompt tokens: " << tokens.size()
               << "\nMax tokens: " << options.max_tokens << '\n';
   std::string reply;
-  for (std::size_t index = 0; index < options.max_tokens; ++index) {
-    const auto step = runner.SelectNext(*state, sampler);
-    if (step.stop)
-      break;
-    runner.Advance(*state, step.token);
-    sampler.Accept(step.token);
-    reply += step.piece;
-    std::cout << step.piece << std::flush;
+  if (!descriptor.capabilities.multi_token_decode) {
+    for (std::size_t index = 0; index < options.max_tokens; ++index) {
+      const auto step = runner.SelectNext(*state, sampler);
+      if (step.stop)
+        break;
+      runner.Advance(*state, step.token);
+      sampler.Accept(step.token);
+      reply += step.piece;
+      std::cout << step.piece << std::flush;
+    }
+  } else {
+    std::size_t generated = 0;
+    while (generated < options.max_tokens) {
+      const auto step =
+          runner.DecodeStep(*state, options.max_tokens - generated, sampler);
+      if (step.stop && step.selections.empty())
+        break;
+      for (const auto& selection : step.selections) {
+        if (selection.stop || generated >= options.max_tokens)
+          break;
+        sampler.Accept(selection.token);
+        reply += selection.piece;
+        std::cout << selection.piece << std::flush;
+        ++generated;
+      }
+      if (step.stop || step.selections.empty())
+        break;
+    }
   }
   std::cout << '\n';
   return reply;
@@ -216,4 +262,4 @@ int RunDeepSeekChat(const ext::TextPromptOptions& options,
   }
 }
 
-}  // namespace gufo::models::deepseek_v41_flash
+}  // namespace DS41_VARIANT_NAMESPACE

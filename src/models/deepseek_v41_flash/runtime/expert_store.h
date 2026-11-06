@@ -5,6 +5,10 @@
 
 #include <hip/hip_runtime_api.h>
 
+#include "variant.h"
+
+DS41_NAMESPACE_BEGIN
+
 struct ds41_expert_store;
 struct ds41_model;
 struct ds41_weights;
@@ -131,5 +135,7 @@ ds41_expert_store_stats ds41_expert_store_get_stats(
     const ds41_expert_store* store);
 ds41_expert_cache_status ds41_expert_store_get_cache_status(const ds41_expert_store* store);
 void ds41_expert_store_log(const ds41_expert_store* store);
+
+DS41_NAMESPACE_END
 
 #endif  // GUFO_MODELS_DEEPSEEK_V41_FLASH_RUNTIME_EXPERT_STORE_H_

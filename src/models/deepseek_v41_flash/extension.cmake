@@ -70,20 +70,54 @@ if(ENGINE_ENABLE_HIP)
     roc::hipblas)
 endif()
 
+# Compile each variant-dependent source twice. The generated wrapper defines
+# the compile-time shape and namespace before including the implementation;
+# the target sees one translation unit per variant and no object library.
+set(DS41_VARIANT_SOURCES
+  engine.cpp
+  runtime/expert_store.cpp
+  runtime/model_data.cpp
+  runtime/tokenizer.cpp
+  runtime/v41_decode.cpp
+  runtime/v41_dspark.cpp
+  runtime/v41_session.cpp
+  runner.cpp
+  drivers.cpp
+  bench.cpp)
+
+function(ds41_variant_wrapper out variant coder namespace source)
+  string(REPLACE "/" "_" slug "${source}")
+  string(REPLACE ".cpp" "" slug "${slug}")
+  set(path "${CMAKE_CURRENT_BINARY_DIR}/variant/${variant}/${slug}.cpp")
+  file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/variant/${variant}")
+  set(content "#define DS41_VARIANT_CODER ${coder}\n")
+  string(APPEND content "#define DS41_VARIANT_NAMESPACE ${namespace}\n")
+  string(APPEND content "#include \"src/models/deepseek_v41_flash/${source}\"\n")
+  file(WRITE "${path}" "${content}")
+  set(${out} "${path}" PARENT_SCOPE)
+endfunction()
+
+set(DEEPSEEK_V41_FLASH_VARIANT_WRAPPERS)
+foreach(ds41_variant IN ITEMS v384 coder)
+  if(ds41_variant STREQUAL "coder")
+    set(ds41_coder 1)
+    set(ds41_namespace "gufo::models::deepseek_v41_flash::coder")
+  else()
+    set(ds41_coder 0)
+    set(ds41_namespace "gufo::models::deepseek_v41_flash::v384")
+  endif()
+  foreach(ds41_source IN LISTS DS41_VARIANT_SOURCES)
+    ds41_variant_wrapper(ds41_wrapper "${ds41_variant}" "${ds41_coder}"
+                        "${ds41_namespace}" "${ds41_source}")
+    list(APPEND DEEPSEEK_V41_FLASH_VARIANT_WRAPPERS "${ds41_wrapper}")
+  endforeach()
+endforeach()
+
 gufo_extension_target(
   NAME gufo_deepseek_v41_flash_hip
   SOURCES
-    engine.cpp
-    runtime/expert_store.cpp
-    runtime/model_data.cpp
-    runtime/tokenizer.cpp
-    runtime/v41_decode.cpp
-    runtime/v41_dspark.cpp
-    runtime/v41_session.cpp
-    runner.cpp
-    drivers.cpp
-    bench.cpp
     provider.cpp
+    ${DEEPSEEK_V41_FLASH_VARIANT_WRAPPERS}
   LINK_LIBRARIES
     gufo_deepseek_v41_flash
     gufo_deepseek_v41_flash_mmq

@@ -9,7 +9,7 @@
 
 #include "src/models/deepseek_v41_flash/runtime/model_data_internal.h"
 
-namespace gufo::models::deepseek_v41_flash {
+namespace DS41_VARIANT_NAMESPACE {
 namespace {
 
 constexpr std::size_t kErrorCapacity = 512;
@@ -343,6 +343,10 @@ void Session::Invalidate() noexcept {
   ds41_session_invalidate(session_);
 }
 
+void Session::ResetForReuse() {
+  ds41_session_reset(session_);
+}
+
 int Session::SelectNext(float temperature, std::uint64_t* rng_state, int top_k,
                         float top_p, float min_p) const {
   if (temperature <= 0.0F) {
@@ -535,4 +539,4 @@ bool SessionSnapshot::CopyTo(
   return true;
 }
 
-}  // namespace gufo::models::deepseek_v41_flash
+}  // namespace DS41_VARIANT_NAMESPACE

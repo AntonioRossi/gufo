@@ -6,26 +6,66 @@
   "entry": "deepseek_v41_flash_register",
   "registration_target": "gufo_deepseek_v41_flash",
   "depends": [],
-  "platforms": ["linux"],
+  "platforms": [
+    "linux"
+  ],
   "providers": [
     {
       "id": "deepseek41",
       "capability": "text_generation",
-      "keys": ["gguf:deepseek41"],
-      "model_ids": ["deepseek41"],
+      "keys": [
+        "gguf:deepseek41"
+      ],
+      "model_ids": [
+        "deepseek41"
+      ],
       "target": "gufo_deepseek_v41_flash_hip",
       "entry": "deepseek_v41_flash_provider_register"
+    },
+    {
+      "id": "deepseek41-coder",
+      "capability": "text_generation",
+      "keys": [
+        "gguf:deepseek41"
+      ],
+      "model_ids": [
+        "deepseek41-coder"
+      ],
+      "target": "gufo_deepseek_v41_flash_hip",
+      "entry": "deepseek_v41_flash_coder_provider_register",
+      "speculative": [
+        "dspark"
+      ]
     }
   ],
   "options": [],
   "targets": {
-    "gufo_deepseek_v41_flash": {"requires": []},
-    "gufo_deepseek_v41_flash_hip": {"requires": ["hip"]}
+    "gufo_deepseek_v41_flash": {
+      "requires": []
+    },
+    "gufo_deepseek_v41_flash_hip": {
+      "requires": [
+        "hip"
+      ]
+    }
   },
-  "licenses": ["src/models/deepseek_v41_flash/LICENSE.ds4"],
+  "licenses": [
+    "src/models/deepseek_v41_flash/LICENSE.ds4"
+  ],
   "production_paths": {
-    "include": ["**/*.cpp", "**/*.h", "**/*.hpp", "**/*.hip", "extension.*"],
-    "exclude": ["tests/", "functional/", "tools/", "fixtures/"]
+    "include": [
+      "**/*.cpp",
+      "**/*.h",
+      "**/*.hpp",
+      "**/*.hip",
+      "extension.*"
+    ],
+    "exclude": [
+      "tests/",
+      "functional/",
+      "tools/",
+      "fixtures/"
+    ]
   },
   "vendored_paths": [
     "src/models/deepseek_v41_flash/runtime/",
@@ -33,7 +73,7 @@
   ],
   "docs": {
     "title": "DeepSeek V4.1 Flash",
-    "inputs": "Flash 1017 ISTA GSQ-RCO IQ1_M GGUF; text; one serial session",
+    "inputs": "Flash 1017 GGUF; text; 384 serial and Coder 1-8 sessions with DSpark",
     "guide": "docs/models/deepseek-v4.1-flash/README.md"
   },
   "tests": [
@@ -53,6 +93,8 @@
       "check_pr": true
     }
   ],
-  "test_labels": ["ds41"],
+  "test_labels": [
+    "ds41"
+  ],
   "fixtures": "tests/models/deepseek_v41_flash/fixtures/"
 }

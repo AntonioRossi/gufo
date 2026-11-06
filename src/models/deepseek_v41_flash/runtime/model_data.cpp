@@ -35,8 +35,11 @@
 #include "model_data_internal.h"
 #include "native_internal.h"
 #include "v41_dspark.h"
+#include <gufo/ext/crypto.hpp>
 #include <gufo/ext/host.hpp>
 #include <gufo/ext/mapped_prefetch.hpp>
+
+DS41_NAMESPACE_BEGIN
 
 static uint32_t g_ds41_compress_ratios[DS41_N_LAYER] = {0};
 
@@ -1274,6 +1277,15 @@ static void config_validate_model(const ds41_model* m) {
   if (required_string(m, "general.architecture") != "deepseek41") {
     ds41_die("model architecture is not deepseek41");
   }
+#if DS41_VARIANT_CODER
+  if (required_string(m, "general.name") != DS41_MODEL_NAME)
+    ds41_die("the Coder model identity does not match the proposal");
+  uint64_t transformer_bytes = 0;
+  for (uint32_t i = 0; i < m->n_shards; i++)
+    transformer_bytes += m->shard_size[i];
+  if (m->n_shards != 5 || transformer_bytes != DS41_TRANSFORMER_BYTES)
+    ds41_die("the Coder transformer shard set does not match the proposal");
+#endif
   struct U32Key {
     const char* key;
     uint32_t want;
@@ -1531,6 +1543,11 @@ static void dspark_bind(ds41_dspark_model* d, ds41_dspark_tensor* dst,
 static void dspark_open(ds41_dspark_model* d, const char* path) {
   ds41_model* m = &d->file;
   model_open(m, model_shard_paths(path));
+#if DS41_VARIANT_CODER
+  if (m->n_shards != 1 || m->shard_size[0] != DS41_DSPARK_BYTES ||
+      gufo::crypto::Sha256FileHex(path) != DS41_DSPARK_SHA256)
+    ds41_die("the shared DSpark drafter identity does not match the proposal");
+#endif
   const std::string arch = required_string(m, "general.architecture");
   const bool lucebox = arch == "deepseek41-dflash-draft";
   if (arch != "dflash" && !lucebox)
@@ -1674,6 +1691,10 @@ static void engram_open(ds41_engram_tables* e, const ds41_weights* w,
                         const ds41_model* backbone, const std::string& path) {
   model_open(&e->file, {path});
   const ds41_model* m = &e->file;
+#if DS41_VARIANT_CODER
+  if (m->n_shards != 1 || m->shard_size[0] != DS41_ENGRAM_BYTES)
+    ds41_die("the shared Engram identity does not match the proposal");
+#endif
   /* The Engram file has no architecture of its own; it belongs to the build
    * through the split bookkeeping and the bucket counts of the hash. */
   if (m->n_tensors != 1 ||
@@ -1821,6 +1842,12 @@ static void ds41_acquire_instance_lock(void) {
 /* Primes the streamed expert cache from the model's histogram file when one
  * sits beside it, otherwise from the built-in ranking. */
 static void seed_experts(ds41_engine* e) {
+#if DS41_VARIANT_CODER
+  /* The Coder has one checked-in rank. Do not replace it with a histogram
+   * beside the model, and do not fall back to another ranking. */
+  if (!ds41_expert_store_seed_default(e->expert_store))
+    fprintf(stderr, "ds41: failed to warm the Coder expert cache\n");
+#else
   const char* histogram = e->expert_histogram;
   const bool custom = access(histogram, F_OK) == 0;
   if (custom && !ds41_expert_store_seed(e->expert_store, histogram)) {
@@ -1830,6 +1857,7 @@ static void seed_experts(ds41_engine* e) {
   } else if (!custom && !ds41_expert_store_seed_default(e->expert_store)) {
     fprintf(stderr, "ds41: failed to warm the expert cache\n");
   }
+#endif
 }
 
 int ds41_engine_open(ds41_engine** out, const ds41_engine_options* opt) {
@@ -2099,3 +2127,5 @@ void ds41_engine_close(ds41_engine* e) {
   free(e->model);
   free(e);
 }
+
+DS41_NAMESPACE_END

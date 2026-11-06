@@ -16,7 +16,7 @@
 #include "src/models/deepseek_v41_flash/engine.hpp"
 #include "src/models/deepseek_v41_flash/runner.hpp"
 
-namespace gufo::models::deepseek_v41_flash {
+namespace DS41_VARIANT_NAMESPACE {
 namespace {
 
 struct BenchStats {
@@ -210,4 +210,4 @@ int RunDeepSeekBenchmark(const ext::TextBenchOptions& options,
   return 0;
 }
 
-}  // namespace gufo::models::deepseek_v41_flash
+}  // namespace DS41_VARIANT_NAMESPACE

@@ -3,6 +3,10 @@
 
 #include <cstdint>
 
+#include "variant.h"
+
+DS41_NAMESPACE_BEGIN
+
 inline constexpr uint32_t DS41_TENSOR_F32 = 0;
 inline constexpr uint32_t DS41_TENSOR_F16 = 1;
 inline constexpr uint32_t DS41_TENSOR_Q8_0 = 8;
@@ -26,5 +30,7 @@ inline constexpr uint32_t DS41_TENSOR_MXFP4 = 39;
  * Upstream ggml gives type 43 to unscaled F8_E4M3; the table's byte size
  * tells the two apart. */
 inline constexpr uint32_t DS41_TENSOR_MXFP8 = 43;
+
+DS41_NAMESPACE_END
 
 #endif  // GUFO_MODELS_DEEPSEEK_V41_FLASH_RUNTIME_TENSOR_TYPES_H_

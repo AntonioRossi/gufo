@@ -16,8 +16,14 @@
 
 #include "model_data_internal.h"
 
+#include "variant.h"
+
+/* Kernel-owned types stay global; the variant namespace only owns the
+ * runtime's model, session and drafter types. */
 struct ds41_v41_proposal;
 struct ds41_v41_sample_result;
+
+DS41_NAMESPACE_BEGIN
 
 struct ds41_decoder;
 struct ds41_engine;
@@ -144,3 +150,5 @@ bool ds41_v41_linear(uint32_t type, const void* w, uint32_t rows, uint32_t k, co
 bool ds41_decoder_output_head(const ds41_decoder* d, const float* x, float* logits, uint32_t n);
 bool ds41_decoder_embed(const ds41_decoder* d, const int* tokens, uint32_t n, float* host_rows);
 const float* ds41_decoder_freq_plain(const ds41_decoder* d);
+
+DS41_NAMESPACE_END

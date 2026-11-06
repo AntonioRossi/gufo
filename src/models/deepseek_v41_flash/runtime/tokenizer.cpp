@@ -12,6 +12,8 @@
 
 #include "native_internal.h"
 
+DS41_NAMESPACE_BEGIN
+
 using token_vec = ds41_tokens;
 
 [[noreturn]] static void tokenizer_die(const char* message) {
@@ -800,3 +802,5 @@ int ds41_token_eos(const ds41_engine *engine) {
 bool ds41_token_is_stop(const ds41_engine *engine, int token) {
     return engine && ds41_vocab_is_stop(engine->vocab, token);
 }
+
+DS41_NAMESPACE_END
