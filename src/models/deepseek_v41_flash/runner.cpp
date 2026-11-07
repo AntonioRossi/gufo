@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <gufo/ext/component_cache_resources.hpp>
 #include <gufo/ext/host.hpp>
 #include <limits>
 #include <mutex>
@@ -12,6 +13,9 @@
 
 #include "src/models/deepseek_v41_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v41_flash/engine.hpp"
+#if DS41_VARIANT_CODER
+#include "src/models/deepseek_v41_flash/continuation_adapter.hpp"
+#endif
 
 namespace DS41_VARIANT_NAMESPACE {
 namespace {
@@ -51,6 +55,7 @@ struct Execution {
   }
 };
 
+#if !DS41_VARIANT_CODER
 class Slot final : public cache::Slot {
 public:
   Slot(std::shared_ptr<Execution> execution, cache::MutationGuard& guard,
@@ -201,6 +206,29 @@ public:
     return cache::TransferResult::kSucceeded;
   }
 };
+#else
+class State final : public ext::TextRunnerState {
+public:
+  State(std::shared_ptr<Execution> execution, ContinuationAdapter& adapter,
+        cache::Slot& slot)
+      : execution_(std::move(execution)), adapter_(adapter), slot_(slot) {}
+  void SetCancellationCheck(const CancellationCheck& check) override {
+    const std::lock_guard lock(execution_->mutex);
+    session().SetCancellationCheck(check);
+  }
+  void Invalidate() noexcept override {
+    const std::lock_guard lock(execution_->mutex);
+    (void)adapter_.Invalidate(slot_);
+  }
+  Session& session() const { return adapter_.GetSession(slot_); }
+  const Execution* execution() const { return execution_.get(); }
+
+private:
+  std::shared_ptr<Execution> execution_;
+  ContinuationAdapter& adapter_;
+  cache::Slot& slot_;
+};
+#endif
 
 std::vector<TextRunnerToken> RunnerTokens(std::span<const int> tokens) {
   std::vector<TextRunnerToken> result;
@@ -240,18 +268,15 @@ public:
                          .batched_multi_token_decode = use_dspark_,
                          .batched_multi_token_decode_max_width =
                              use_dspark_ ? 8u : 0u,
-                         .prefix_reuse = false},
+                         .prefix_reuse = bool(DS41_VARIANT_CODER)},
         .sampling_preset = sampling::TextModelPreset::kDeepSeekV41Flash};
   }
 
   ext::TextRunnerResourceClaim ResourceClaim() const override {
     ext::TextRunnerResourceClaim claim;
 #if DS41_VARIANT_CODER
-    /* The Coder has no snapshot or prompt-cache backing. The shared
-     * component cache still reserves its metadata; keep a small nonzero
-     * ceiling so an automatic RAM-cache request can start. */
-    claim.retained_snapshot_capacity_bytes = 1u << 20;
-    claim.retained_snapshot_ceiling_bytes = 1u << 20;
+    claim.retained_snapshot_capacity_bytes = ext::HostSnapshotBudgetBytes();
+    claim.retained_snapshot_ceiling_bytes = ext::HostSnapshotCeilingBytes();
 #else
     claim.retained_snapshot_capacity_bytes = 0;
     claim.retained_snapshot_ceiling_bytes = ext::HostSnapshotCeilingBytes();
@@ -306,6 +331,43 @@ public:
     return RenderChat(input.messages, input.tools, input.options);
   }
 
+#if DS41_VARIANT_CODER
+  std::optional<ext::TextPreparedPrompt> PreparePrompt(
+      const ext::ChatRequest& request) const override {
+    auto prepared = ext::TextModelRunner::PreparePrompt(request);
+    if (prepared) {
+      auto continuation = request;
+      continuation.messages.emplace_back(ext::ChatRole::kUser, "");
+      const auto continued = RenderAndTokenize(continuation);
+      if (continued)
+        prepared->cache_prefix_tokens = static_cast<std::size_t>(
+            std::mismatch(prepared->tokens.begin(), prepared->tokens.end(),
+                          continued->begin(), continued->end())
+                .first -
+            prepared->tokens.begin());
+    }
+    return prepared;
+  }
+
+  void PreparePrefixReuse(
+      ext::TextRunnerState& state,
+      std::span<const TextRunnerToken> prefix) const override {
+    const std::lock_guard lock(execution_->mutex);
+    auto& session = RequireState(state).session();
+    if (static_cast<std::size_t>(session.Position()) != prefix.size() ||
+        !session.CanContinue(prefix.size()))
+      throw std::logic_error(
+          "DeepSeek V4.1 prefix differs from its checkpoint");
+    session.BeginRequest();
+  }
+
+  bool HasDecodeFrontier(const ext::TextRunnerState& state) const override {
+    const std::lock_guard lock(execution_->mutex);
+    const auto& session = RequireState(state).session();
+    return session.Position() > 0 && session.CanContinue(session.Position());
+  }
+#endif
+
   ext::InitialOutputState InitialOutputState(
       const ext::ChatRequest& request) const override {
     return ResolveDeepSeekChatOptions(request.reasoning).enable_thinking
@@ -321,20 +383,51 @@ public:
   }
 
   std::unique_ptr<ext::ComponentCacheResources> CreateComponentCacheResources(
-      cache::ResourceLedger&, std::size_t) const override {
+      cache::ResourceLedger& ledger, std::size_t) const override {
+#if DS41_VARIANT_CODER
+    const std::lock_guard lock(execution_->mutex);
+    const auto address =
+        reinterpret_cast<std::uintptr_t>(execution_->model.get());
+    const auto* bytes = reinterpret_cast<const std::uint8_t*>(&address);
+    cache::Identity identity(bytes, bytes + sizeof(address));
+    for (unsigned i = 0; i < 4; ++i)
+      identity.push_back(
+          static_cast<std::uint8_t>(max_draft_tokens_ >> (8 * i)));
+    return hip::CreateHipComponentCacheResources(
+        std::make_unique<ContinuationAdapter>(
+            execution_->model,
+            use_dspark_ ? core::SessionMode::kSpeculative
+                        : core::SessionMode::kAutoregressive,
+            execution_->model->MaxContext(), std::move(identity),
+            std::move(execution_->idle)),
+        ledger,
+        {[] { return ext::HostSnapshotCeilingBytes(); }, [](std::string_view){},
+         [](std::string_view) {}});
+#else
+    (void)ledger;
     auto resources = std::make_unique<ext::ComponentCacheResources>();
     resources->adapter = std::make_unique<Adapter>(execution_);
     resources->stream = [] { return std::make_unique<Stream>(); };
     return resources;
+#endif
   }
 
   std::unique_ptr<ext::TextRunnerState> BindComponentState(
       cache::Adapter& adapter, cache::Slot& slot) const override {
+#if DS41_VARIANT_CODER
+    auto& native = dynamic_cast<ContinuationAdapter&>(adapter);
+    if (!native.Owns(*execution_->model))
+      throw std::invalid_argument(
+          "DeepSeek V4.1 slot belongs to another runner");
+    (void)native.GetSession(slot);
+    return std::make_unique<State>(execution_, native, slot);
+#else
     const auto& native = dynamic_cast<Adapter&>(adapter).RequireSlot(slot);
     if (native.execution() != execution_.get())
       throw std::invalid_argument(
           "DeepSeek V4.1 slot belongs to another runner");
     return std::make_unique<State>(dynamic_cast<Slot&>(slot));
+#endif
   }
 
   void ReconcileComponentState(ext::TextRunnerState& state,
@@ -362,7 +455,17 @@ public:
     for (const auto token : prompt.first(offset + consumed))
       prefix.push_back(EngineToken(token));
     std::string error;
-    if (!session.Sync(prefix, &error, prompt.size()))
+#if DS41_VARIANT_CODER
+    // A retained boundary must be usable at its own position. Later growing
+    // prompts then satisfy bounded replay without a hidden full prefill.
+    if (offset && !session.CanContinue(prefix.size()))
+      throw std::logic_error(
+          "DeepSeek V4.1 retained prefix lacks decoder coverage");
+    const auto prompt_end = prefix.size();
+#else
+    const auto prompt_end = prompt.size();
+#endif
+    if (!session.Sync(prefix, &error, prompt_end))
       throw std::runtime_error("DeepSeek V4.1 prefill failed: " + error);
     return {.consumed_tokens = consumed,
             .decode_ready = offset + consumed == prompt.size()};
@@ -679,7 +782,8 @@ std::shared_ptr<ext::TextModelRunner> CreateDeepSeekTextRunner(
     if (!options.vision_model_path.empty())
       throw std::invalid_argument("DeepSeek V4.1 vision is not supported");
     if (!options.disk_cache.directory.empty() ||
-        (options.ram_cache.enabled && options.ram_cache.capacity_bytes != 0))
+        (!DS41_VARIANT_CODER && options.ram_cache.enabled &&
+         options.ram_cache.capacity_bytes != 0))
       throw std::invalid_argument(
           "DeepSeek V4.1 prompt caching is not supported");
     if (options.enable_yarn)

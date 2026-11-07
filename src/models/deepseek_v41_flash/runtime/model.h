@@ -60,6 +60,17 @@ struct ds41_session_batch_item {
 };
 
 inline constexpr uint32_t DS41_DSPARK_CANDIDATES = 8;
+inline constexpr uint32_t DS41_DSPARK_BLOCK = 5;
+
+// Request control at a committed checkpoint. Counters and sampler ownership
+// remain with the execution/request; they are not restored from a prefix.
+struct ds41_session_request_state {
+  float accept[DS41_DSPARK_BLOCK]{};
+  float cycle_ms[DS41_DSPARK_BLOCK + 1]{};
+  float draft_ms{}, gain_ms{};
+  uint32_t plain{}, probe{}, lookup_resume{}, lookup_request_start{};
+  int32_t next{-1};
+};
 
 struct ds41_dspark_candidates {
   int32_t ids[DS41_DSPARK_CANDIDATES];
@@ -352,9 +363,17 @@ int ds41_decoder_adopt(ds41_decoder* decoder, const int* tokens, uint32_t n);
 /* Positions [first, end) are about to be evaluated (rows written). */
 typedef void (*ds41_session_write_fn)(void* user_data, uint32_t first,
                                       uint32_t end);
+using ds41_session_mutation_fn = void (*)(void* user_data);
 void ds41_session_set_write_hook(ds41_session* session,
                                  ds41_session_write_fn callback,
-                                 void* user_data);
+                                 void* user_data,
+                                 ds41_session_mutation_fn before_reset = nullptr,
+                                 ds41_session_mutation_fn before_restore = nullptr);
+bool ds41_session_coherent(const ds41_session* session);
+bool ds41_session_capturable(const ds41_session* session);
+ds41_session_request_state ds41_session_request(const ds41_session* session);
+bool ds41_session_restore_request(ds41_session* session,
+                                  const ds41_session_request_state& request);
 ds41_decoder* ds41_session_decoder(ds41_session* session);
 /* Whether the session holds evaluated state (false after a failed step). */
 bool ds41_session_valid(const ds41_session* session);

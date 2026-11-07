@@ -40,12 +40,28 @@ tool-delta path. Schema enforcement has the same strict and non-strict
 limits as the source grammar. The client executes the tools and returns
 their results; the model server does not execute them.
 
-The adapter rejects vision and explicit prompt-cache settings. The 384
-variant also rejects speculative decoding and request batching. The Coder
+The adapter rejects vision and disk prompt caching. The 384 variant also
+rejects speculative decoding, request batching, and explicit RAM prompt-cache
+capacity. The Coder
 accepts `--speculative dspark` with `--dspark-model`; its sessions are
-speculative and its AR requests can use batch widths 2 through 8. Prefix
-reuse, snapshots, and persistent prompt caching are unavailable. Each CLI
+speculative and its AR requests can use batch widths 2 through 8. Each CLI
 chat turn resets the pooled session before the new prompt.
+
+Coder HTTP requests use the shared component cache. Each layer has private
+window and compressor state. FP4 attention codes, indexer codes, and their
+scales have separate append components. Tokens, logits, metadata, and the
+DSpark ring complete a checkpoint. A restore must supply every component at
+the same valid boundary before the session can execute. The native restore
+reconstructs decoder position and Engram history from evaluated tokens.
+The runner resets request lookup and acceptance policy before a new request;
+session timing estimates keep their native behavior.
+
+`--cache-ram-bytes 0` selects automatic sizing. A positive value selects a
+retained-cache cap. `off` disables retained RAM checkpoints and permits reuse
+of live state. `cache_prompt: false` bypasses prefix lookup for an uncached
+comparison. It can still populate the cache. A growing prompt reuses a usable
+checkpoint boundary and prefills the remaining suffix. This cache does not
+change expert storage or the 384 variant's prompt-cache restriction.
 
 The imported decoder keeps native YaRN. The `--enable-yarn` option is
 unsupported; that option selects additional context scaling for Qwen.
@@ -75,6 +91,13 @@ files are `ds41.template`, `qwen38_flash_next.prompt_lookup`,
 `ds41.candidate_mask`. The last four need a `gfx1151` HIP device.
 These checks do not establish model loading or HTTP generation.
 The CPU `ds41.probe_status` check covers the optional probe status component.
+The CPU `ds41.continuation_layout` check covers Coder component positions,
+FP4 code and scale sizes, private state sizes, and backing allocation.
+The HIP `ds41.continuation_adapter` check needs
+`GUFO_DEEPSEEK_V41_CODER_MODEL` and `GUFO_DEEPSEEK_V41_CODER_DSPARK_MODEL`.
+It loads the resident Coder once at context 8192. It checks AR and DSpark
+restores, frontier logits, continued tokens, and rejection of partial state.
+It uses a full-session snapshot only as a reference for the restore check.
 The CPU `ds41.tool_calls` check covers request conversion, the scanner,
 and required-tool grammar. The shared HTTP and constraint tests include
 the source V4.1 cases, including incremental and interrupted calls.

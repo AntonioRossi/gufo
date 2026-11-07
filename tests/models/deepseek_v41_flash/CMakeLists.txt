@@ -19,7 +19,28 @@ target_link_libraries(ds41_probe_status_test PRIVATE gufo_core)
 add_test(NAME ds41.probe_status COMMAND ds41_probe_status_test)
 set_tests_properties(ds41.probe_status PROPERTIES LABELS "cpu;ds41")
 
+add_executable(ds41_continuation_layout_test
+  continuation_layout_test.cpp
+  ${PROJECT_SOURCE_DIR}/src/models/deepseek_v41_flash/continuation_layout.cpp)
+target_link_libraries(ds41_continuation_layout_test PRIVATE gufo_core)
+target_compile_definitions(ds41_continuation_layout_test PRIVATE
+  DS41_VARIANT_CODER=1
+  DS41_VARIANT_NAMESPACE=gufo::models::deepseek_v41_flash::coder)
+add_test(NAME ds41.continuation_layout COMMAND ds41_continuation_layout_test)
+set_tests_properties(ds41.continuation_layout PROPERTIES LABELS "cpu;ds41;cache")
+
 if(TARGET gufo_deepseek_v41_flash_hip)
+  add_executable(ds41_continuation_adapter_test continuation_adapter_test.cpp)
+  target_link_libraries(ds41_continuation_adapter_test PRIVATE
+    gufo_deepseek_v41_flash_hip gufo_cache_hip hip::host)
+  target_compile_definitions(ds41_continuation_adapter_test PRIVATE
+    DS41_VARIANT_CODER=1
+    DS41_VARIANT_NAMESPACE=gufo::models::deepseek_v41_flash::coder)
+  add_test(NAME ds41.continuation_adapter COMMAND ds41_continuation_adapter_test)
+  set_tests_properties(ds41.continuation_adapter PROPERTIES
+    LABELS "gpu;hip;ds41;cache;external-model;slow"
+    RESOURCE_LOCK ds41_model SKIP_RETURN_CODE 77)
+
   foreach(ds41_test mmq_typed attention hc_state_pass candidate_mask)
     add_executable(ds41_${ds41_test}_test ${ds41_test}_test.cpp)
     target_link_libraries(ds41_${ds41_test}_test PRIVATE

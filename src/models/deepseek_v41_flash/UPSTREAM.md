@@ -14,11 +14,11 @@ The port base is Gufo `67dd6354c73fb1325809c7a8f47dd3d30105638c`.
 The common ancestor, for attribution, is
 `12effe369662ac572cb100cd20157f56a74e2da0`.
 
-This first port supports text with one serial session on Linux `gfx1151`.
-The adapter supports ordinary autoregressive generation with resident or
+The 384 variant supports text with one serial session on Linux `gfx1151`.
+Its adapter supports ordinary autoregressive generation with resident or
 streamed experts. The selected check mode uses `--stream-experts` and
 `--expert-cache-bytes 68719476736`. The imported loader reads Engram data
-from the SSD. The adapter does not enable DSpark, vision, request
+from the SSD. The 384 adapter does not enable DSpark, vision, request
 batching, prefix reuse, snapshots, or persistent prompt caching.
 This port does not claim conformance.
 
@@ -67,8 +67,12 @@ The import uses the public forwarding headers for core declarations.
 The loader, expert store, and ROCm backend use the current core log header
 through `gufo/ext/host.hpp`.
 
-The import excludes `vision/`, `continuation_adapter.cpp`, and
-`continuation_adapter.hpp`. It also excludes the unused `reference/`,
+The import excludes `vision/` and the source continuation adapter.
+The Coder component adapter follows the V4 component contract in
+`AntonioRossi/gufo` at `f27c25ff060ee8ccfaba9352e662d3bded0a8da2`.
+It uses V4.1 native state parts and separate FP4 code and scale components.
+It leaves the 384 adapter's cache restriction unchanged.
+The import also excludes the unused `reference/`,
 `artifact_hint.hpp`, and `dspark_sampler.hpp`.
 The source scanner uses the existing extension argument and call types.
 Its parsing rules are unchanged. The source CMake

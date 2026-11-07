@@ -74,6 +74,8 @@ endif()
 # the compile-time shape and namespace before including the implementation;
 # the target sees one translation unit per variant and no object library.
 set(DS41_VARIANT_SOURCES
+  continuation_layout.cpp
+  continuation_adapter.cpp
   engine.cpp
   runtime/expert_store.cpp
   runtime/model_data.cpp
@@ -107,6 +109,9 @@ foreach(ds41_variant IN ITEMS v384 coder)
     set(ds41_namespace "gufo::models::deepseek_v41_flash::v384")
   endif()
   foreach(ds41_source IN LISTS DS41_VARIANT_SOURCES)
+    if(ds41_variant STREQUAL "v384" AND ds41_source MATCHES "^continuation_")
+      continue()
+    endif()
     ds41_variant_wrapper(ds41_wrapper "${ds41_variant}" "${ds41_coder}"
                         "${ds41_namespace}" "${ds41_source}")
     list(APPEND DEEPSEEK_V41_FLASH_VARIANT_WRAPPERS "${ds41_wrapper}")

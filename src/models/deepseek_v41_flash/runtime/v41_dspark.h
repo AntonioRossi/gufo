@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "model_data_internal.h"
+#include "model.h"
 
 #include "variant.h"
 
@@ -30,7 +31,6 @@ struct ds41_engine;
 struct ds41_dspark_sampler;
 
 inline constexpr uint32_t DS41_DSPARK_STAGES = 3;
-inline constexpr uint32_t DS41_DSPARK_BLOCK = 5;
 /* Sessions one ds41_dspark_draft_batch takes. */
 inline constexpr uint32_t DS41_DSPARK_MAX_BATCH = 8;
 inline constexpr uint32_t DS41_DSPARK_TARGET_LAYERS = 3;

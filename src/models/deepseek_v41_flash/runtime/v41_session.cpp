@@ -10,6 +10,7 @@
  * verifies the tokens that followed them (prompt lookup) instead of a draft. */
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -41,6 +42,8 @@ struct ds41_session {
   void* cancel_data = nullptr;
   ds41_session_write_fn before_write = nullptr;
   void* write_data = nullptr;
+  ds41_session_mutation_fn before_reset = nullptr;
+  ds41_session_mutation_fn before_restore = nullptr;
   ds41_dspark_state* dspark = nullptr;
   gufo::speculative::PromptLookup<int> lookup;
   /* The last token a speculative step emitted, not evaluated yet: the next
@@ -245,8 +248,6 @@ int ds41_session_sync(ds41_session* s, const ds41_tokens* prompt, int prompt_end
     set_error(error, capacity, "prompt contains an invalid token ID");
     return 1;
   }
-  /* The prompt carries any token a speculative step left unevaluated. */
-  s->next = -1;
   const size_t n = (size_t)prompt->len;
   /* 0 evaluates every decoder row (exact prefill). */
   const uint32_t replay_end = ds41_engine_exact_prefill(s->engine) ? 0 : (uint32_t)prompt_end;
@@ -254,7 +255,11 @@ int ds41_session_sync(ds41_session* s, const ds41_tokens* prompt, int prompt_end
   const bool extends = s->valid && s->tokens.size() <= n && s->decoder_from <= replay_from(replay_end) &&
                        std::equal(s->tokens.begin(), s->tokens.end(), prompt->v);
   if (!extends || s->tokens.size() == n) {
-    if (extends) return 0; /* already at this prompt; its logits are current */
+    if (extends) {
+      s->next = -1;
+      return 0; /* already at this prompt; its logits are current */
+    }
+    if (s->before_reset) s->before_reset(s->write_data);
     if (ds41_decoder_reset(s->decoder) != 0) {
       set_error(error, capacity, "ROCm decoder reset failed");
       return 1;
@@ -266,6 +271,8 @@ int ds41_session_sync(ds41_session* s, const ds41_tokens* prompt, int prompt_end
     s->lookup.Clear();
     if (s->dspark) ds41_dspark_state_reset(s->dspark, 0);
   }
+  /* The prompt carries any token a speculative step left unevaluated. */
+  s->next = -1;
   /* A span may continue past this part of the prompt. */
   for (size_t i = 0; i < n_images; i++) {
     const ds41_image_span& image = images[i];
@@ -965,6 +972,7 @@ int ds41_session_save_snapshot(const ds41_session* s, ds41_session_snapshot* sna
 
 int ds41_session_load_snapshot(ds41_session* s, const ds41_session_snapshot* snapshot, char* error,
                                size_t capacity) {
+  if (s && s->before_restore) s->before_restore(s->write_data);
   uint64_t header[5];
   if (!s || !snapshot || !snapshot->ptr || snapshot->len < sizeof(header)) {
     set_error(error, capacity, "invalid snapshot");
@@ -1027,15 +1035,70 @@ void ds41_session_invalidate(ds41_session* s) {
 
 void ds41_session_reset(ds41_session* s) {
   if (!s) return;
+  if (s->before_reset) s->before_reset(s->write_data);
   ds41_session_invalidate(s);
   (void)ds41_decoder_reset(s->decoder);
   ds41_session_set_cancel(s, nullptr, nullptr);
 }
 
-void ds41_session_set_write_hook(ds41_session* s, ds41_session_write_fn callback, void* user_data) {
+void ds41_session_set_write_hook(ds41_session* s, ds41_session_write_fn callback, void* user_data,
+                                 ds41_session_mutation_fn before_reset,
+                                 ds41_session_mutation_fn before_restore) {
   if (!s) return;
   s->before_write = callback;
   s->write_data = user_data;
+  s->before_reset = before_reset;
+  s->before_restore = before_restore;
+}
+
+bool ds41_session_coherent(const ds41_session* s) {
+  if (!s) return false;
+  const auto n = s->tokens.size();
+  return ds41_decoder_pos(s->decoder) == n && (s->valid || n == 0) &&
+         (!s->dspark || ds41_dspark_state_end(s->dspark) == n);
+}
+
+bool ds41_session_capturable(const ds41_session* s) {
+  return ds41_session_coherent(s) && s->valid && s->decoder_from < s->tokens.size();
+}
+
+ds41_session_request_state ds41_session_request(const ds41_session* s) {
+  ds41_session_request_state result{};
+  if (!s) return result;
+  std::copy(std::begin(s->policy.accept), std::end(s->policy.accept), result.accept);
+  std::copy(std::begin(s->policy.cycle_ms), std::end(s->policy.cycle_ms), result.cycle_ms);
+  result.draft_ms = s->policy.draft_ms;
+  result.gain_ms = s->policy.gain_ms;
+  result.plain = s->policy.plain;
+  result.probe = s->policy.probe;
+  const auto lookup = s->lookup.Save();
+  result.lookup_resume = lookup.resume;
+  result.lookup_request_start = lookup.request_start;
+  result.next = s->next;
+  return result;
+}
+
+bool ds41_session_restore_request(ds41_session* s, const ds41_session_request_state& request) {
+  if (!s || !s->valid || request.next < -1 || request.next >= (int)vocab(s) ||
+      !std::isfinite(request.draft_ms) || request.draft_ms < 0 ||
+      !std::isfinite(request.gain_ms) || request.probe == 0 || request.probe > s->kProbeMax)
+    return false;
+  for (float value : request.accept)
+    if (!std::isfinite(value) || value < 0 || value > 1) return false;
+  for (float value : request.cycle_ms)
+    if (!std::isfinite(value) || value < 0) return false;
+  const gufo::speculative::PromptLookup<int>::State lookup{
+      .resume = request.lookup_resume, .request_start = request.lookup_request_start};
+  if (!gufo::speculative::PromptLookup<int>::Valid(lookup, s->tokens.size())) return false;
+  std::copy(std::begin(request.accept), std::end(request.accept), s->policy.accept);
+  std::copy(std::begin(request.cycle_ms), std::end(request.cycle_ms), s->policy.cycle_ms);
+  s->policy.draft_ms = request.draft_ms;
+  s->policy.gain_ms = request.gain_ms;
+  s->policy.plain = request.plain;
+  s->policy.probe = request.probe;
+  s->lookup.Restore(lookup);
+  s->next = request.next;
+  return true;
 }
 
 ds41_decoder* ds41_session_decoder(ds41_session* s) { return s ? s->decoder : nullptr; }
@@ -1048,6 +1111,7 @@ float* ds41_session_logits(ds41_session* s) { return s ? s->logits.data() : null
 
 int* ds41_session_begin_restore(ds41_session* s, uint32_t n) {
   if (!s || n == 0 || n >= (uint32_t)s->context) return nullptr;
+  s->tokens.reserve(n);
   s->valid = false;
   s->tokens.resize(n);
   return s->tokens.data();

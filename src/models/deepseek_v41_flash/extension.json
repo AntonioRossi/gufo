@@ -91,6 +91,11 @@
       "target": "ds41_probe_status_test",
       "ctest": "ds41\\.probe_status",
       "check_pr": true
+    },
+    {
+      "target": "ds41_continuation_layout_test",
+      "ctest": "ds41\\.continuation_layout",
+      "check_pr": true
     }
   ],
   "test_labels": [
