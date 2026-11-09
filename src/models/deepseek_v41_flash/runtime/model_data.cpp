@@ -1543,11 +1543,9 @@ static void dspark_bind(ds41_dspark_model* d, ds41_dspark_tensor* dst,
 static void dspark_open(ds41_dspark_model* d, const char* path) {
   ds41_model* m = &d->file;
   model_open(m, model_shard_paths(path));
-#if DS41_VARIANT_CODER
   if (m->n_shards != 1 || m->shard_size[0] != DS41_DSPARK_BYTES ||
       gufo::crypto::Sha256FileHex(path) != DS41_DSPARK_SHA256)
     ds41_die("the shared DSpark drafter identity does not match the proposal");
-#endif
   const std::string arch = required_string(m, "general.architecture");
   const bool lucebox = arch == "deepseek41-dflash-draft";
   if (arch != "dflash" && !lucebox)

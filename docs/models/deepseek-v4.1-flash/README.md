@@ -6,10 +6,11 @@ describes the source fork at `01fb6f4e39464003efffd97d79607005146280f0`.
 Its optional functions exceed this port's scope.
 
 The extension has two `deepseek41` variants in one executable. The 384-expert
-IQ1_M variant uses one serial session. The 192-expert Coder variant uses one
-through eight sessions in AR or DSpark. Both variants target Linux x86-64 and
+IQ1_M variant uses one or two serial sessions. The 192-expert Coder variant
+uses one through eight sessions in AR or DSpark. Both variants target Linux x86-64 and
 AMD `gfx1151`, and both use the `prompt`, `chat`, and HTTP text interfaces.
-Select 1 to 8 sessions with `--sessions N` or `-j N`; the default remains one.
+Select sessions with `--sessions N` or `-j N`, within the variant limit.
+The default remains one.
 
 The selected 384 artifact is ISTA GSQ-RCO `IQ1_M` at revision
 `65d53bc8be65123e255ff02f3ded958b6dbf54fd`. The Coder artifact is ISTA GSQ-RCO
@@ -40,15 +41,18 @@ tool-delta path. Schema enforcement has the same strict and non-strict
 limits as the source grammar. The client executes the tools and returns
 their results; the model server does not execute them.
 
-The adapter rejects vision and disk prompt caching. The 384 variant also
-rejects speculative decoding, request batching, and explicit RAM prompt-cache
-capacity. The Coder
+The adapter rejects vision and disk prompt caching. The 384 HTTP adapter
+accepts DSpark with the pinned Q8_0 drafter, one or two serial sessions,
+and default draft controls. It rejects other speculative backends and request batching.
+It accepts a positive RAM prompt-cache capacity. Its DSpark state ABI is
+`deepseek-v41-flash-1017-ds-v1`. The 384 CLI prompt and chat paths still
+reject speculative decoding. The Coder
 accepts `--speculative dspark` with `--dspark-model`; its sessions are
 speculative and its AR requests can use batch widths 2 through 8. Each CLI
 chat turn resets the pooled session before the new prompt.
 
-Coder HTTP requests use the shared component cache. Each layer has private
-window and compressor state. FP4 attention codes, indexer codes, and their
+Both variants' HTTP requests use the shared component cache. Each layer has
+private window and compressor state. FP4 attention codes, indexer codes, and their
 scales have separate append components. Tokens, logits, metadata, and the
 DSpark ring complete a checkpoint. A restore must supply every component at
 the same valid boundary before the session can execute. The native restore
@@ -61,7 +65,9 @@ retained-cache cap. `off` disables retained RAM checkpoints and permits reuse
 of live state. `cache_prompt: false` bypasses prefix lookup for an uncached
 comparison. It can still populate the cache. A growing prompt reuses a usable
 checkpoint boundary and prefills the remaining suffix. This cache does not
-change expert storage or the 384 variant's prompt-cache restriction.
+change expert storage. The 384 adapter supports retained checkpoints and
+restored-prefix execution with one or two serial sessions. A configured
+context or cache cap does not establish tested depth or host capacity.
 
 The imported decoder keeps native YaRN. The `--enable-yarn` option is
 unsupported; that option selects additional context scaling for Qwen.

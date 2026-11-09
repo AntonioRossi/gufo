@@ -40,11 +40,13 @@ inline constexpr uint32_t DS41_VARIANT_EXPERT_COUNT = 384;
 inline constexpr char DS41_MODEL_SHAPE_NAME[] = "DeepSeek V4.1 Flash";
 inline constexpr char DS41_MODEL_NAME[] = "DeepSeek-V4.1-Flash-1017";
 inline constexpr char DS41_STATE_ABI_AR[] = "deepseek-v41-flash-1017-ar-v1";
-inline constexpr char DS41_STATE_ABI_DSPARK[] = "";
+inline constexpr char DS41_STATE_ABI_DSPARK[] =
+    "deepseek-v41-flash-1017-ds-v1";
 inline constexpr uint64_t DS41_TRANSFORMER_BYTES = 0;
 inline constexpr uint64_t DS41_ENGRAM_BYTES = 0;
-inline constexpr uint64_t DS41_DSPARK_BYTES = 0;
-inline constexpr char DS41_DSPARK_SHA256[] = "";
+inline constexpr uint64_t DS41_DSPARK_BYTES = 7976914240ull;
+inline constexpr char DS41_DSPARK_SHA256[] =
+    "6ba6ac1b331c540691a209e7fc97dec2a24e295acb1e755c84c7d24a4373927a";
 DS41_NAMESPACE_END
 #endif
 
