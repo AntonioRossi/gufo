@@ -10,7 +10,7 @@ gufo_extension_target(
     extension.cpp
   LINK_LIBRARIES
     gufo_ext_runtime
-    gufo_core
+    gufo_ext_core
 )
 
 if(TARGET gufo_deepseek_v41_flash)
@@ -123,7 +123,8 @@ gufo_extension_target(
   LINK_LIBRARIES
     gufo_deepseek_v41_flash
     gufo_deepseek_v41_flash_mmq
-    gufo_core
+    gufo_ext_core
+    gufo_ext_hip
     gufo_logging
     gufo_ext_cache
     hip::host

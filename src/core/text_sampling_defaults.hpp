@@ -12,12 +12,7 @@ namespace gufo::sampling {
 
 /// Core presets kept for existing extensions; new providers supply
 /// `TextSamplingDefaults` instead.
-enum class TextModelPreset {
-  kUnspecified,
-  kQwen38,
-  kDeepSeekV4Flash,
-  kDeepSeekV41Flash
-};
+enum class TextModelPreset { kUnspecified, kQwen38, kDeepSeekV4Flash };
 
 // Presence is independent of value: an explicit zero must override a preset.
 struct SamplingOverrides {
@@ -38,8 +33,6 @@ struct SamplingOverrides {
 };
 
 inline TextModelPreset TextPreset(const core::ModelConfig& config) {
-  if (config.architecture == "deepseek41")
-    return TextModelPreset::kDeepSeekV41Flash;
   if (config.architecture == "deepseek4")
     return TextModelPreset::kDeepSeekV4Flash;
   if (config.architecture == "qwen4exp" ||
@@ -90,7 +83,7 @@ inline std::optional<TextSamplingDefaults> PresetDefaults(
     return std::nullopt;
   TextSamplingValues on;
   on.temperature = 1.0F;
-  on.top_p = model == TextModelPreset::kDeepSeekV41Flash ? 1.0F : 0.95F;
+  on.top_p = 0.95F;
   TextSamplingValues off = on;
   if (model == TextModelPreset::kQwen38) {
     on.top_k = 20;

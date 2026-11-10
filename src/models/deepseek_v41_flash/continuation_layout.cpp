@@ -7,24 +7,31 @@ namespace DS41_VARIANT_NAMESPACE {
 ContinuationLayout::ContinuationLayout(ContinuationGeometry geometry,
                                        std::uint32_t context)
     : geometry_(std::move(geometry)), context_(context) {
-  if (!context || !geometry_.vocabulary || geometry_.ratios.empty() ||
+  if (!context || !geometry_.vocabulary || !geometry_.window_rows ||
+      geometry_.ratios.empty() ||
       geometry_.ratios.size() != geometry_.part_bytes.size())
     throw std::invalid_argument("invalid V4.1 continuation geometry");
   const auto add = [&](ContinuationPart part, std::size_t row,
-                       std::size_t state, std::uint32_t index = 0) {
+                       std::size_t state, std::uint32_t index = 0,
+                       cache::Rows window = 0) {
     const auto id = static_cast<std::uint32_t>(components_.size() + 1);
-    // A device-row chunk fills one backing page, including FP4 scale rows.
-    const cache::Rows chunk = !row ? 0
+    // The native ring has no slack beyond the live window. One row per chunk
+    // meets window_rows + rows_per_chunk - 1 without changing native kernels.
+    // Growing device rows retain their existing backing-page chunk size.
+    const cache::Rows chunk = window ? 1
+                              : !row ? 0
                               : part == ContinuationPart::kTokens
                                   ? 256
                                   : (65536 + row - 1) / row;
     components_.push_back({{{id},
-                            1,
-                            row ? cache::ComponentKind::kAppendRows
-                                : cache::ComponentKind::kPrivateState,
+                            kContinuationLayoutVersion,
+                            window ? cache::ComponentKind::kWindowRows
+                            : row  ? cache::ComponentKind::kAppendRows
+                                   : cache::ComponentKind::kPrivateState,
                             row,
                             chunk,
-                            state},
+                            state,
+                            window},
                            part,
                            index});
   };
@@ -34,10 +41,10 @@ ContinuationLayout::ContinuationLayout(ContinuationGeometry geometry,
   add(ContinuationPart::kMetadata, 0, kContinuationMetadataBytes);
   for (std::uint32_t layer = 0; layer < geometry_.ratios.size(); ++layer) {
     const auto& bytes = geometry_.part_bytes[layer];
-    if (!bytes[0])
+    if (!bytes[0] || bytes[0] % geometry_.window_rows)
       throw std::invalid_argument("V4.1 layer has no window");
-    add(ContinuationPart::kLayerState, 0, bytes[0] + bytes[5] + bytes[6],
-        layer);
+    add(ContinuationPart::kDecoderWindow, bytes[0] / geometry_.window_rows, 0,
+        layer, geometry_.window_rows);
     if (!geometry_.ratios[layer]) {
       for (std::size_t part = 1; part < bytes.size(); ++part)
         if (bytes[part])
@@ -47,13 +54,25 @@ ContinuationLayout::ContinuationLayout(ContinuationGeometry geometry,
     if (!bytes[1] || !bytes[2] || !bytes[3] || !bytes[4] || !bytes[5] ||
         !bytes[6])
       throw std::invalid_argument("incomplete V4.1 compressed layer");
+    // Ratio-one sources write compressed rows directly and do not use pools.
+    if (geometry_.ratios[layer] > 1)
+      add(ContinuationPart::kPoolingState, 0, bytes[5] + bytes[6], layer);
     add(ContinuationPart::kAttentionRows, bytes[1], 0, layer);
     add(ContinuationPart::kAttentionScales, bytes[2], 0, layer);
     add(ContinuationPart::kIndexerRows, bytes[3], 0, layer);
     add(ContinuationPart::kIndexerScales, bytes[4], 0, layer);
   }
-  if (geometry_.draft_bytes)
-    add(ContinuationPart::kDraftWindow, 0, geometry_.draft_bytes);
+  if (geometry_.draft_bytes) {
+    const auto rows =
+        std::size_t{geometry_.draft_stages} * geometry_.window_rows;
+    if (!rows || geometry_.draft_bytes % rows)
+      throw std::invalid_argument("invalid V4.1 draft ring geometry");
+    for (std::uint32_t stage = 0; stage < geometry_.draft_stages; ++stage)
+      add(ContinuationPart::kDraftWindow, geometry_.draft_bytes / rows, 0,
+          stage, geometry_.window_rows);
+  } else if (geometry_.draft_stages) {
+    throw std::invalid_argument("V4.1 draft stages have no ring");
+  }
 }
 std::vector<cache::ComponentPosition> ContinuationLayout::Positions(
     std::uint32_t position) const {
@@ -79,8 +98,12 @@ std::size_t ContinuationLayout::PrivateBytes() const noexcept {
 std::size_t ContinuationLayout::RowBytes(std::uint32_t position) const {
   const auto positions = Positions(position);
   std::size_t result = 0;
-  for (std::size_t i = 0; i < components_.size(); ++i)
-    result += components_[i].descriptor.row_bytes * positions[i].valid_rows;
+  for (std::size_t i = 0; i < components_.size(); ++i) {
+    const auto& descriptor = components_[i].descriptor;
+    result += descriptor.row_bytes *
+              (positions[i].valid_rows -
+               cache::FirstChunkRow(descriptor, positions[i].valid_rows));
+  }
   return result;
 }
 std::vector<cache::BackingClass> ContinuationLayout::BackingPlan(

@@ -14,7 +14,8 @@ enum class ContinuationPart {
   kTokens,
   kLogits,
   kMetadata,
-  kLayerState,
+  kDecoderWindow,
+  kPoolingState,
   kAttentionRows,
   kAttentionScales,
   kIndexerRows,
@@ -31,9 +32,12 @@ struct ContinuationGeometry {
   // Native ds41_state_part order. Zero denotes a part absent from the layer.
   std::vector<std::array<std::size_t, 7>> part_bytes;
   std::uint32_t vocabulary{};
+  std::uint32_t window_rows{};
+  std::uint32_t draft_stages{};
   std::size_t draft_bytes{};
 };
 inline constexpr std::size_t kContinuationMetadataBytes = 128;
+inline constexpr std::uint32_t kContinuationLayoutVersion = 2;
 class ContinuationLayout {
 public:
   ContinuationLayout(ContinuationGeometry, std::uint32_t context);

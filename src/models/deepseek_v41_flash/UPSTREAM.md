@@ -14,28 +14,30 @@ The port base is Gufo `67dd6354c73fb1325809c7a8f47dd3d30105638c`.
 The common ancestor, for attribution, is
 `12effe369662ac572cb100cd20157f56a74e2da0`.
 
-The 384 variant supports text with one serial session on Linux `gfx1151`.
-Its adapter supports ordinary autoregressive generation with resident or
-streamed experts. The selected check mode uses `--stream-experts` and
-`--expert-cache-bytes 68719476736`. The imported loader reads Engram data
-from the SSD. The 384 adapter does not enable DSpark, vision, request
-batching, prefix reuse, snapshots, or persistent prompt caching.
-This port does not claim conformance.
+The 384 variant supports one or two serial HTTP sessions on Linux `gfx1151`.
+The Coder variant supports one through eight sessions. Both support AR and
+HTTP DSpark, with resident or streamed experts and RAM prefix reuse.
+The 384 prompt and chat paths support AR only. Both variants reject vision
+and persistent service prompt caching. This port does not claim conformance.
+See the [implementation notes](../../../docs/internal/models/deepseek-v4.1-flash/README.md)
+for the selected artifacts and check limits.
 
 Streaming uses `Model::Load`, `Model::FitExpertCache`, and the expert store
-from the pinned source. The adapter fits the cache after its one session
-and persistent buffers exist. Snapshots and prompt-cache backing are absent.
+from the pinned source. The adapter fits the cache after all selected sessions
+and persistent buffers exist. The shared component cache supplies RAM backing.
 The source cap, cache-fit calculations, and memory reserves are unchanged.
 The added `ExpertCacheStatus` getter reports the store's requested limit,
 allocated bytes, and current limit. It does not alter allocation.
-The host forwards both options through `TextPromptOptions` and
-`TextRunnerOptions`. Other providers retain false and zero defaults.
+The extension manifest declares both options. The host sends explicit values
+through `provider_options`. `ResolveExpertOptions` supplies the defaults and
+checks the cache condition. Other providers do not accept these options.
 The optional probe status and its small stage component are local check
 additions. The loader's generic failure reason is `engine_open_failed`.
 
 Native YaRN remains in the imported decoder. The adapter rejects the
 `--enable-yarn` option for additional Qwen context scaling.
-The runner and both CLI paths use the source `kDeepSeekV41Flash` preset:
+The runner and both CLI paths use `DeepSeekSamplingDefaults` through the
+upstream typed provider interface. It preserves the source sampling values:
 temperature 1.0 and top-p 1.0, with explicit overrides preserved.
 See `ResolveTextSampling` in the
 [source sampling defaults](https://github.com/franzmoca/gufo/blob/01fb6f4e39464003efffd97d79607005146280f0/src/core/text_sampling_defaults.hpp).
@@ -51,13 +53,14 @@ and mean with sample standard deviation. Decode starts from 16 tokens at
 depth zero. The model and expert store remain alive across repetitions.
 The benchmark does not call `FitExpertCache`, as in the source benchmark.
 It reports the existing `ExpertCacheStatus` outside the measured intervals.
-`TextBenchOptions` forwards the streaming flag and cache cap. Sampled
+`TextBenchOptions::provider_options` forwards the streaming flag and cache cap. Sampled
 decoding, nonzero depth, concurrency, and prefill validation are not exposed
 by this first benchmark path. Prompt, chat, and HTTP paths are unchanged.
 
 The host target contains the chat template, tool scanner, sampling, probe,
 and registration. `ConvertChat` maps text requests and tool history into the
-source template types. The runner selects the native `kDeepSeek41` grammar.
+source template types. The runner selects the registered `deepseek41` dialect.
+`DeepSeekToolGrammar` supplies its syntax to the upstream grammar compiler.
 The HTTP parser uses the registered dialect and the existing response and
 streaming paths. Required and forced tool selection use the shared server
 constraints. Image input remains unsupported.
@@ -68,10 +71,9 @@ The loader, expert store, and ROCm backend use the current core log header
 through `gufo/ext/host.hpp`.
 
 The import excludes `vision/` and the source continuation adapter.
-The Coder component adapter follows the V4 component contract in
-`AntonioRossi/gufo` at `f27c25ff060ee8ccfaba9352e662d3bded0a8da2`.
-It uses V4.1 native state parts and separate FP4 code and scale components.
-It leaves the 384 adapter's cache restriction unchanged.
+Both variants use the upstream window-row component contract. The adapter
+uses V4.1 native state parts and separate FP4 code and scale components.
+Required pooling state remains private. Service disk caching stays disabled.
 The import also excludes the unused `reference/`,
 `artifact_hint.hpp`, and `dspark_sampler.hpp`.
 The source scanner uses the existing extension argument and call types.

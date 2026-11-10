@@ -2,6 +2,8 @@
 
 #include <array>
 #include <cassert>
+#include <gufo/ext/options.hpp>
+#include <gufo/ext/registry.hpp>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -25,18 +27,31 @@ void TestDefaultOptions() {
   assert(!opt->verbose);
   assert(opt->draft_tokens == 7);
   assert(opt->min_draft_tokens == 1);
-  assert(!opt->stream_experts && opt->expert_cache_bytes == 0);
+  assert(opt->provider_options.empty());
 }
 
 void TestExpertStreamingFlags() {
+#ifdef GUFO_TEST_DEEPSEEK41_OPTIONS
   const char* args[] = {"--stream-experts", "--expert-cache-bytes",
                         "68719476736", "Hello"};
   const auto opt = gufo::cli::ParsePromptOptions(args);
-  assert(opt && opt->stream_experts);
-  assert(opt->expert_cache_bytes == 68719476736ULL);
+  assert(opt);
+  gufo::ext::Registry registry;
+  gufo::ext::RegisterBuiltExtensions(registry);
+  const std::string_view provider_args[] = {
+      "--stream-experts", "--expert-cache-bytes", "68719476736"};
+  const auto parsed =
+      gufo::ext::ParseOptions(registry, "prompt", provider_args);
+  const auto* streaming =
+      gufo::ext::FindOption<bool>(parsed, "--stream-experts");
+  assert(streaming && *streaming);
+  const auto* bytes =
+      gufo::ext::FindOption<std::int64_t>(parsed, "--expert-cache-bytes");
+  assert(bytes && *bytes == 68719476736LL);
   std::string error;
   assert(!gufo::cli::ParsePromptOptions(
       std::array{"--expert-cache-bytes", "invalid"}, &error));
+#endif
 }
 
 void TestExplicitFlags() {

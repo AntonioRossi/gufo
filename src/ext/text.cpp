@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <deque>
 #include <stdexcept>
 #include <utility>
 
@@ -103,9 +104,19 @@ std::size_t TextModelRunner::PrepareConstraintVocabulary() const {
   return constraint_vocabulary_ ? constraint_vocabulary_->size() : 0;
 }
 
+ReasoningMarkup TextModelRunner::ReasoningDelimiters() const {
+  const auto tags = ReasoningBudgetTags();
+  const auto close = tags.ends.empty() ? tags.forced_end : tags.ends.front();
+  // A runner that declares no budget tags keeps the host's classic framing.
+  if (close.empty())
+    return {"<think>", "</think>"};
+  return {std::string(tags.start), std::string(close)};
+}
+
 std::shared_ptr<const sampling::ReasoningBudget>
-TextModelRunner::BuildReasoningBudget(
-    std::size_t tokens, std::span<const TextRunnerToken> prompt) const {
+TextModelRunner::BuildReasoningBudget(std::size_t tokens,
+                                      std::span<const TextRunnerToken> prompt,
+                                      ext::InitialOutputState initial) const {
   const auto tags = ReasoningBudgetTags();
   const auto start = TokenizeControl(tags.start);
   auto forced = TokenizeControl(tags.forced_end);
@@ -120,13 +131,20 @@ TextModelRunner::BuildReasoningBudget(
       return nullptr;
     budget->ends.push_back(token.front());
   }
-  const auto opened =
-      std::ranges::find(prompt.rbegin(), prompt.rend(), start.front());
-  if (opened != prompt.rend())
-    budget->prompt.assign(opened.base(), prompt.end());
+  // An automatic output opens its own block; an opener in the prompt belongs
+  // to an earlier turn.
+  if (initial == ext::InitialOutputState::kAuto) {
+    budget->opener = start.front();
+  } else {
+    const auto opened =
+        std::ranges::find(prompt.rbegin(), prompt.rend(), start.front());
+    if (opened != prompt.rend())
+      budget->prompt.assign(opened.base(), prompt.end());
+  }
   const std::lock_guard lock(constraint_mutex_);
   if (!partial_utf8_ && VocabularySize() != 0) {
     auto partial = std::make_shared<std::vector<bool>>(VocabularySize());
+    auto blank = std::make_shared<std::vector<bool>>(VocabularySize());
     for (TextRunnerToken token = 0; token < partial->size(); ++token) {
       const auto text = Decode(std::span(&token, 1));
       bool complete = text.empty();
@@ -141,10 +159,14 @@ TextModelRunner::BuildReasoningBudget(
         }
       }
       (*partial)[token] = !complete;
+      (*blank)[token] = !text.empty() &&
+                        text.find_first_not_of(" \t\r\n") == std::string::npos;
     }
     partial_utf8_ = std::move(partial);
+    blank_tokens_ = std::move(blank);
   }
   budget->partial_utf8 = partial_utf8_;
+  budget->blank = blank_tokens_;
   return budget;
 }
 
@@ -153,7 +175,8 @@ TextModelRunner::BuildReasoningBudget(
 // ---------------------------------------------------------------------------
 
 static std::vector<TextProvider> g_text_providers;
-static std::vector<ToolDialect> g_tool_dialects;
+// A deque keeps registered dialects at stable addresses.
+static std::deque<ToolDialect> g_tool_dialects;
 
 void RegisterTextProvider(TextProvider provider) {
   for (auto& existing : g_text_providers) {
@@ -184,7 +207,10 @@ const TextProvider* ProbeTextProvider(std::string_view model_root) {
 }
 
 const TextProvider* ProbeTextProvider(const core::GgufReader& reader) {
+  const bool unsized = reader.FirstUnsizedTensor() != nullptr;
   for (const auto& provider : g_text_providers) {
+    if (unsized && !provider.accepts_unsized_tensors)
+      continue;
     if (provider.probe_gguf && provider.probe_gguf(reader)) {
       return &provider;
     }
@@ -192,9 +218,49 @@ const TextProvider* ProbeTextProvider(const core::GgufReader& reader) {
   return nullptr;
 }
 
+std::string_view BuiltinToolDialectId(
+    sampling::JsonConstraint::ToolFormat format) {
+  using Format = sampling::JsonConstraint::ToolFormat;
+  switch (format) {
+    case Format::kQwen:
+      return "qwen";
+    case Format::kDeepSeek:
+      return "deepseek";
+    case Format::kJson:
+      break;
+  }
+  return "json";
+}
+
+std::string TextModelRunner::ToolDialectId() const {
+  return std::string(BuiltinToolDialectId(ToolFormat()));
+}
+
 void RegisterToolDialect(ToolDialect dialect) {
+  using Format = sampling::JsonConstraint::ToolFormat;
+  if (dialect.id.empty())
+    dialect.id = std::string(BuiltinToolDialectId(dialect.format));
+  const auto fail = [&](std::string_view reason) {
+    throw std::invalid_argument("tool dialect '" + dialect.id + "' " +
+                                std::string(reason));
+  };
+  if (dialect.id == BuiltinToolDialectId(Format::kJson) ||
+      dialect.id == BuiltinToolDialectId(Format::kQwen))
+    fail("is built into the host");
+  if (dialect.markers.empty() || dialect.scan_tool_calls == nullptr)
+    fail("needs markers and scan_tool_calls");
+  if (std::ranges::any_of(dialect.markers, [](std::string_view marker) {
+        return marker.find('<') == std::string_view::npos;
+      }))
+    fail("has a marker without '<'");
+  if (dialect.syntax
+          ? std::ranges::find(dialect.markers,
+                              std::string_view(dialect.syntax->open)) ==
+                dialect.markers.end()
+          : dialect.format == Format::kJson)
+    fail("needs a syntax opened by one of its markers, or a native format");
   for (auto& existing : g_tool_dialects) {
-    if (existing.format == dialect.format) {
+    if (existing.id == dialect.id) {
       existing = std::move(dialect);
       return;
     }
@@ -202,14 +268,18 @@ void RegisterToolDialect(ToolDialect dialect) {
   g_tool_dialects.push_back(std::move(dialect));
 }
 
-const ToolDialect* FindToolDialect(
-    sampling::JsonConstraint::ToolFormat format) {
+const ToolDialect* FindToolDialect(std::string_view id) {
   for (const auto& dialect : g_tool_dialects) {
-    if (dialect.format == format) {
+    if (dialect.id == id) {
       return &dialect;
     }
   }
   return nullptr;
+}
+
+const ToolDialect* FindToolDialect(
+    sampling::JsonConstraint::ToolFormat format) {
+  return FindToolDialect(BuiltinToolDialectId(format));
 }
 
 std::vector<const ToolDialect*> AllToolDialects() {

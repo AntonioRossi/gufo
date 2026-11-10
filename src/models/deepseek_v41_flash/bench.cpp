@@ -1,3 +1,5 @@
+#include "src/models/deepseek_v41_flash/options.hpp"
+
 // Single-session, depth-zero autoregressive benchmark from franzmoca/gufo
 // 01fb6f4e39464003efffd97d79607005146280f0, src/cli/bench/bench.cpp.
 #include <hip/hip_runtime.h>
@@ -86,8 +88,11 @@ int RunDeepSeekBenchmark(const ext::TextBenchOptions& options,
                  "or --validate-prefill\n";
     return 1;
   }
-  if (options.expert_cache_bytes != 0 && !options.stream_experts) {
-    std::cerr << "Error: --expert-cache-bytes requires --stream-experts\n";
+  ExpertOptions expert_options;
+  try {
+    expert_options = ResolveExpertOptions(options.provider_options);
+  } catch (const std::invalid_argument& error) {
+    std::cerr << "Error: " << error.what() << '\n';
     return 1;
   }
   const auto max_or_zero = [](const std::vector<std::size_t>& values) {
@@ -110,13 +115,13 @@ int RunDeepSeekBenchmark(const ext::TextBenchOptions& options,
   }
 
   std::string error;
-  auto model =
-      Model::Load(options.model_path,
-                  ModelOptions{.max_context = required_context,
-                               .stream_experts = options.stream_experts,
-                               .expert_cache_bytes = options.expert_cache_bytes,
-                               .dspark_model_path = ""},
-                  &error);
+  auto model = Model::Load(
+      options.model_path,
+      ModelOptions{.max_context = required_context,
+                   .stream_experts = expert_options.stream_experts,
+                   .expert_cache_bytes = expert_options.expert_cache_bytes,
+                   .dspark_model_path = ""},
+      &error);
   if (!model) {
     std::cerr << "Error creating DeepSeek V4.1 Flash model: " << error << '\n';
     return 1;

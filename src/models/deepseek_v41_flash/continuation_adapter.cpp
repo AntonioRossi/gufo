@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "src/models/deepseek_v41_flash/runtime/model_data_internal.h"
+#include "src/models/deepseek_v41_flash/runtime/v41_dspark.h"
 
 namespace DS41_VARIANT_NAMESPACE {
 namespace {
@@ -23,7 +24,7 @@ void Check(hipError_t result) {
     throw std::runtime_error(hipGetErrorString(result));
 }
 struct Metadata {
-  std::uint32_t version{1};
+  std::uint32_t version{kContinuationLayoutVersion};
   std::uint32_t position{}, decoder_from{}, draft_start{}, draft_end{};
   ds41_session_request_state request;
 };
@@ -38,11 +39,11 @@ static_assert(offsetof(ds41_session_request_state, next) == 68);
 static_assert(sizeof(Metadata) <= kContinuationMetadataBytes);
 static_assert(std::is_trivially_copyable_v<Metadata>);
 using Coverage = std::vector<std::pair<std::size_t, std::size_t>>;
-bool Covered(Coverage ranges, std::size_t end) {
+bool Covered(Coverage ranges, std::size_t first, std::size_t end) {
   std::ranges::sort(ranges);
-  std::size_t frontier = 0;
-  for (const auto& [first, last] : ranges) {
-    if (first > frontier)
+  std::size_t frontier = first;
+  for (const auto& [begin, last] : ranges) {
+    if (begin < first || begin > frontier || last > end)
       return false;
     frontier = std::max(frontier, last);
   }
@@ -51,6 +52,7 @@ bool Covered(Coverage ranges, std::size_t end) {
 ContinuationGeometry ModelGeometry(ds41_session* session) {
   ContinuationGeometry geometry;
   geometry.vocabulary = DS41_N_VOCAB;
+  geometry.window_rows = DS41_N_SWA;
   auto* decoder = ds41_session_decoder(session);
   for (std::uint32_t layer = 0; layer < DS41_N_LAYER; ++layer) {
     geometry.ratios.push_back(ds41_layer_state_ratio(layer));
@@ -63,8 +65,10 @@ ContinuationGeometry ModelGeometry(ds41_session* session) {
     geometry.part_bytes.push_back(parts);
   }
   std::uint64_t bytes = 0;
-  if (ds41_session_dspark_ring(session, &bytes))
+  if (ds41_session_dspark_ring(session, &bytes)) {
+    geometry.draft_stages = DS41_DSPARK_STAGES;
     geometry.draft_bytes = bytes;
+  }
   return geometry;
 }
 }  // namespace
@@ -149,6 +153,18 @@ public:
   void BeforeWrite(std::uint32_t first, std::uint32_t end) {
     RequireIdle();
     for (const auto& component : adapter.layout_.Components()) {
+      if (component.descriptor.kind == cache::ComponentKind::kWindowRows) {
+        const auto capacity = component.descriptor.window_rows;
+        // Guard both displaced absolute rows and writes to the named range.
+        // A speculative verification can write more rows than it commits.
+        const auto displaced_first = first > capacity ? first - capacity : 0;
+        const auto displaced_end = end > capacity ? end - capacity : 0;
+        if (displaced_first < displaced_end)
+          guard.BeforeOverwrite(component.descriptor.id, displaced_first,
+                                displaced_end);
+        guard.BeforeOverwrite(component.descriptor.id, first, end);
+        continue;
+      }
       if (component.descriptor.kind != cache::ComponentKind::kAppendRows)
         continue;
       const auto ratio =
@@ -172,19 +188,21 @@ public:
     throw std::logic_error("DeepSeek slots restore through the adapter");
   }
   [[nodiscard]] Rows Capacity(const ContinuationComponent& component) const {
-    return component.part == ContinuationPart::kTokens
+    return component.part == ContinuationPart::kTokens ||
+                   component.descriptor.kind ==
+                       cache::ComponentKind::kWindowRows
                ? adapter.context_
                : adapter.context_ /
                      adapter.layout_.Geometry().ratios[component.index];
   }
   void GuardAll() {
     for (const auto& component : adapter.layout_.Components())
-      if (component.descriptor.kind == cache::ComponentKind::kAppendRows)
+      if (cache::HasRows(component.descriptor.kind))
         guard.BeforeOverwrite(component.descriptor.id, 0, Capacity(component));
   }
   void Release() noexcept {
     for (const auto& component : adapter.layout_.Components())
-      if (component.descriptor.kind == cache::ComponentKind::kAppendRows)
+      if (cache::HasRows(component.descriptor.kind))
         guard.BeforeRelease(component.descriptor.id, 0, Capacity(component));
   }
   ContinuationAdapter& adapter;
@@ -241,7 +259,7 @@ ContinuationAdapter::ContinuationAdapter(
     for (unsigned i = 0; i < 4; ++i)
       identity_.push_back(static_cast<std::uint8_t>(value >> (8 * i)));
   };
-  put(1);  // Component layout version.
+  put(kContinuationLayoutVersion);
   put(context);
   put(mode == core::SessionMode::kSpeculative);
   const std::string_view abi = mode == core::SessionMode::kSpeculative
@@ -320,8 +338,20 @@ void* ContinuationAdapter::RowData(
     State& state, const ContinuationComponent& component) const {
   if (component.part == ContinuationPart::kTokens)
     return const_cast<int*>(ds41_session_tokens(state.native()));
+  if (component.part == ContinuationPart::kDraftWindow) {
+    std::uint64_t bytes = 0;
+    auto* data = ds41_session_dspark_ring(state.native(), &bytes);
+    if (!data || bytes != layout_.Geometry().draft_bytes)
+      throw std::logic_error("V4.1 draft geometry changed");
+    const auto stage_bytes =
+        component.descriptor.row_bytes * layout_.Geometry().window_rows;
+    return static_cast<std::byte*>(data) + component.index * stage_bytes;
+  }
   int part;
   switch (component.part) {
+    case ContinuationPart::kDecoderWindow:
+      part = DS41_STATE_WINDOW;
+      break;
     case ContinuationPart::kAttentionRows:
       part = DS41_STATE_COMP;
       break;
@@ -335,14 +365,41 @@ void* ContinuationAdapter::RowData(
       part = DS41_STATE_INDEX_SCALE;
       break;
     default:
-      throw std::invalid_argument("component has no append rows");
+      throw std::invalid_argument("component has no rows");
   }
   std::uint64_t bytes = 0;
   auto* data = ds41_decoder_state_part(ds41_session_decoder(state.native()),
                                        component.index, part, &bytes);
-  if (!data || bytes != component.descriptor.row_bytes)
-    throw std::logic_error("V4.1 append geometry changed");
+  const auto expected = component.descriptor.row_bytes *
+                        (component.part == ContinuationPart::kDecoderWindow
+                             ? layout_.Geometry().window_rows
+                             : 1);
+  if (!data || bytes != expected)
+    throw std::logic_error("V4.1 row geometry changed");
   return data;
+}
+
+ContinuationAdapter::Region ContinuationAdapter::RowRegion(
+    State& state, const ContinuationComponent& component, Rows first,
+    Rows end) const {
+  Region result;
+  if (first == end)
+    return result;
+  const auto& d = component.descriptor;
+  auto* data = static_cast<std::byte*>(RowData(state, component));
+  std::size_t offset = 0;
+  while (first < end) {
+    const auto physical = d.window_rows ? first % d.window_rows : first;
+    const auto rows = d.window_rows
+                          ? std::min(end - first, d.window_rows - physical)
+                          : end - first;
+    const auto bytes = rows * d.row_bytes;
+    result.pieces.push_back({data + physical * d.row_bytes, offset, bytes,
+                             component.part == ContinuationPart::kTokens});
+    first += rows;
+    offset += bytes;
+  }
+  return result;
 }
 
 void ContinuationAdapter::BeginRestore(
@@ -376,6 +433,20 @@ void ContinuationAdapter::BeginRestore(
   state.coverage = std::move(coverage);
   state.metadata.fill(std::byte{});
   state.restoring = true;
+  try {
+    // A shorter restore must not expose rows from the previous ring. Clear
+    // unused slots as well, so native snapshots keep their reset-byte form.
+    for (const auto& component : layout_.Components())
+      if (component.descriptor.kind == cache::ComponentKind::kWindowRows)
+        Check(hipMemsetAsync(
+            RowData(state, component), 0,
+            component.descriptor.window_rows * component.descriptor.row_bytes,
+            nullptr));
+    Check(hipStreamSynchronize(nullptr));
+  } catch (...) {
+    state.failed = true;
+    throw;
+  }
 }
 
 cache::Completion ContinuationAdapter::Transfer(
@@ -407,8 +478,7 @@ cache::Completion ContinuationAdapter::Transfer(
   return cache::Completion(std::move(signal));
 }
 
-// All private components have fixed native byte layouts. Ring data is copied
-// in place; its live range is adopted after the target restore.
+// Private components retain the compressor frontier and continuation metadata.
 ContinuationAdapter::Region ContinuationAdapter::PrivateRegion(
     State& state, const ContinuationComponent& component,
     std::uint32_t position) const {
@@ -431,15 +501,8 @@ ContinuationAdapter::Region ContinuationAdapter::PrivateRegion(
     case ContinuationPart::kMetadata:
       add(state.metadata.data(), state.metadata.size(), true);
       break;
-    case ContinuationPart::kDraftWindow: {
-      std::uint64_t bytes = 0;
-      auto* ring = ds41_session_dspark_ring(state.native(), &bytes);
-      add(ring, bytes);
-      break;
-    }
-    case ContinuationPart::kLayerState:
-      for (int part :
-           {DS41_STATE_WINDOW, DS41_STATE_POOL_KV, DS41_STATE_POOL_SCORE}) {
+    case ContinuationPart::kPoolingState:
+      for (int part : {DS41_STATE_POOL_KV, DS41_STATE_POOL_SCORE}) {
         std::uint64_t bytes = 0;
         auto* data =
             ds41_decoder_state_part(ds41_session_decoder(state.native()),
@@ -592,8 +655,8 @@ cache::Completion ContinuationAdapter::LoadPrivatePiece(
     throw;
   }
 }
-// Copy FP4 codes and scales separately. Private windows do not borrow mutable
-// device storage; retained append ranges use the shared cache's ownership.
+// Copy FP4 codes and scales separately. Window ranges use absolute row numbers
+// and split at the native ring boundary. No mutable ring view is borrowed.
 cache::Completion ContinuationAdapter::CopyRowsOut(const cache::Slot& slot,
                                                    cache::ComponentId id,
                                                    Rows first, Rows end,
@@ -607,19 +670,21 @@ cache::Completion ContinuationAdapter::CopyRowsOut(const cache::Slot& slot,
   const auto positions = Positions(slot);
   const auto row = component.descriptor.row_bytes;
   if (!row || first > end || end > positions[id.value - 1].valid_rows ||
+      first < cache::FirstChunkRow(component.descriptor,
+                                   positions[id.value - 1].valid_rows) ||
       bytes.size() != (end - first) * row)
     throw std::invalid_argument("invalid DeepSeek row capture");
-  auto* source =
-      bytes.empty()
-          ? nullptr
-          : static_cast<std::byte*>(RowData(state, component)) + first * row;
+  const auto region = RowRegion(state, component, first, end);
   return Transfer(
       state, false, stream, [&](gufo::hip::TransferStream& transfer) {
-        if (component.part == ContinuationPart::kTokens && !bytes.empty())
-          std::memcpy(bytes.data(), source, bytes.size());
-        else if (!bytes.empty())
-          Check(hip::CopySnapshotToHost(bytes.data(), source, bytes.size(),
-                                        transfer.Native()));
+        for (const auto& piece : region.pieces) {
+          auto* destination = bytes.data() + piece.offset;
+          if (piece.host)
+            std::memcpy(destination, piece.pointer, piece.bytes);
+          else
+            Check(hip::CopySnapshotToHost(destination, piece.pointer,
+                                          piece.bytes, transfer.Native()));
+        }
       });
 }
 cache::Completion ContinuationAdapter::CopyRowsIn(
@@ -632,23 +697,25 @@ cache::Completion ContinuationAdapter::CopyRowsIn(
     const auto& component = Component(id);
     const auto row = component.descriptor.row_bytes;
     if (!row || first > end || end > state.expected[id.value - 1].valid_rows ||
+        first < cache::FirstChunkRow(component.descriptor,
+                                     state.expected[id.value - 1].valid_rows) ||
         bytes.size() != (end - first) * row)
       throw std::invalid_argument("invalid DeepSeek row restore");
-    auto* destination =
-        bytes.empty()
-            ? nullptr
-            : static_cast<std::byte*>(RowData(state, component)) + first * row;
+    const auto region = RowRegion(state, component, first, end);
     {
       const std::lock_guard lock(state.jobs_mutex);
       state.coverage[id.value - 1].emplace_back(first * row, end * row);
     }
     return Transfer(
         state, true, stream, [&](gufo::hip::TransferStream& transfer) {
-          if (component.part == ContinuationPart::kTokens && !bytes.empty())
-            std::memcpy(destination, bytes.data(), bytes.size());
-          else if (!bytes.empty())
-            Check(hip::CopySnapshotToDevice(destination, bytes.data(),
-                                            bytes.size(), transfer.Native()));
+          for (const auto& piece : region.pieces) {
+            const auto* source = bytes.data() + piece.offset;
+            if (piece.host)
+              std::memcpy(piece.pointer, source, piece.bytes);
+            else
+              Check(hip::CopySnapshotToDevice(piece.pointer, source,
+                                              piece.bytes, transfer.Native()));
+          }
         });
   } catch (...) {
     state.failed = true;
@@ -676,15 +743,17 @@ bool ContinuationAdapter::Validate(
     const auto total = descriptor.row_bytes
                            ? expected.valid_rows * descriptor.row_bytes
                            : descriptor.state_bytes;
-    if (!Covered(state.coverage[i], total))
+    const auto first = descriptor.row_bytes *
+                       cache::FirstChunkRow(descriptor, expected.valid_rows);
+    if (!Covered(state.coverage[i], first, total))
       return refuse();
   }
   Metadata metadata{};
   std::memcpy(&metadata, state.metadata.data(), sizeof(metadata));
   const auto target = state.expected.front().valid_rows;
   const bool speculative = mode_ == core::SessionMode::kSpeculative;
-  if (metadata.version != 1 || metadata.position != target ||
-      metadata.decoder_from >= target ||
+  if (metadata.version != kContinuationLayoutVersion ||
+      metadata.position != target || metadata.decoder_from >= target ||
       (speculative && (metadata.draft_start > metadata.draft_end ||
                        metadata.draft_end != target)) ||
       (!speculative && (metadata.draft_start || metadata.draft_end ||

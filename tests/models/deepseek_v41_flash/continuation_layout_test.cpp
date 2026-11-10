@@ -18,6 +18,7 @@ void Require(bool condition, const char* message) {
 ds41::ContinuationGeometry Production(bool speculative) {
   ds41::ContinuationGeometry geometry;
   geometry.vocabulary = 129280;
+  geometry.window_rows = 128;
   geometry.ratios.resize(40);
   geometry.part_bytes.resize(40);
   for (auto& bytes : geometry.part_bytes)
@@ -29,8 +30,10 @@ ds41::ContinuationGeometry Production(bool speculative) {
         128 * 512 * sizeof(float),  256, 32, 64, 4, ratio * 512 * sizeof(float),
         ratio * 512 * sizeof(float)};
   }
-  if (speculative)
+  if (speculative) {
+    geometry.draft_stages = 3;
     geometry.draft_bytes = 3 * 128 * 512 * sizeof(float);
+  }
   return geometry;
 }
 
@@ -42,7 +45,7 @@ std::size_t Count(const ds41::ContinuationLayout& layout,
 
 void TestInventory() {
   const ds41::ContinuationLayout layout(Production(false), 131072);
-  Require(Count(layout, ds41::ContinuationPart::kLayerState) == 40,
+  Require(Count(layout, ds41::ContinuationPart::kDecoderWindow) == 40,
           "every layer keeps a sliding window");
   for (const auto part : {ds41::ContinuationPart::kAttentionRows,
                           ds41::ContinuationPart::kAttentionScales,
@@ -55,20 +58,20 @@ void TestInventory() {
   for (const auto& component : layout.Components())
     Require(component.descriptor.id.value == ++id, "IDs are dense from one");
   const ds41::ContinuationLayout speculative(Production(true), 131072);
-  Require(Count(speculative, ds41::ContinuationPart::kDraftWindow) == 1,
-          "the native ring contains all three draft stages");
-  Require(speculative.PrivateBytes() - layout.PrivateBytes() ==
+  Require(Count(speculative, ds41::ContinuationPart::kDraftWindow) == 3,
+          "each native draft stage has a window component");
+  Require(speculative.RowBytes(128) - layout.RowBytes(128) ==
               3 * 128 * 512 * sizeof(float),
           "draft ring bytes");
 }
 
 void TestPrivateBytes() {
   const ds41::ContinuationLayout layout(Production(false), 4096);
-  const auto expected =
-      129280 * sizeof(float) + ds41::kContinuationMetadataBytes +
-      40 * 128 * 512 * sizeof(float) + (3 * 2 + 1) * 2 * 512 * sizeof(float);
+  const auto expected = 129280 * sizeof(float) +
+                        ds41::kContinuationMetadataBytes +
+                        3 * 2 * 2 * 512 * sizeof(float);
   Require(layout.PrivateBytes() == expected,
-          "logits, metadata, windows, and compressor frontiers are private");
+          "logits, metadata, and used compressor frontiers are private");
 }
 
 void TestPositions() {
@@ -78,8 +81,9 @@ void TestPositions() {
           "one position per component");
   for (std::size_t i = 0; i < positions.size(); ++i) {
     const auto& component = layout.Components()[i];
-    const bool compressed = component.descriptor.row_bytes &&
-                            component.part != ds41::ContinuationPart::kTokens;
+    const bool compressed =
+        component.descriptor.kind == cache::ComponentKind::kAppendRows &&
+        component.part != ds41::ContinuationPart::kTokens;
     const auto expected =
         compressed ? 1031 / layout.Geometry().ratios[component.index] : 1031;
     Require(positions[i].valid_rows == expected,
@@ -99,12 +103,17 @@ void TestRowsAndBacking() {
   const std::size_t tokens = 8192;
   Require(layout.RowBytes(tokens) ==
               tokens * sizeof(std::int32_t) +
-                  (3 * (tokens / 2) + tokens) * (256 + 32 + 64 + 4),
+                  (3 * (tokens / 2) + tokens) * (256 + 32 + 64 + 4) +
+                  40 * 128 * 512 * sizeof(float),
           "FP4 codes and scales have distinct row widths");
   for (const auto& component : layout.Components()) {
     const auto& d = component.descriptor;
-    if (d.kind != cache::ComponentKind::kAppendRows)
+    if (d.kind == cache::ComponentKind::kPrivateState)
       Require(!d.rows_per_chunk && !d.row_bytes, "private state has no rows");
+    else if (d.kind == cache::ComponentKind::kWindowRows)
+      Require(
+          d.window_rows + d.rows_per_chunk - 1 <= layout.Geometry().window_rows,
+          "the native ring holds the retained window chunks");
     else if (component.part != ds41::ContinuationPart::kTokens)
       Require(d.rows_per_chunk * d.row_bytes >= 65536,
               "a device-row chunk fills a backing page");

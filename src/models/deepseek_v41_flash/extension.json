@@ -20,7 +20,15 @@
         "deepseek41"
       ],
       "target": "gufo_deepseek_v41_flash_hip",
-      "entry": "deepseek_v41_flash_provider_register"
+      "entry": "deepseek_v41_flash_provider_register",
+      "speculative": [
+        "dspark"
+      ],
+      "serving": {
+        "draft_options": {
+          "dspark": "--dspark-model"
+        }
+      }
     },
     {
       "id": "deepseek41-coder",
@@ -35,10 +43,61 @@
       "entry": "deepseek_v41_flash_coder_provider_register",
       "speculative": [
         "dspark"
-      ]
+      ],
+      "serving": {
+        "draft_options": {
+          "dspark": "--dspark-model"
+        }
+      }
     }
   ],
-  "options": [],
+  "options": [
+    {
+      "name": "--stream-experts",
+      "type": "boolean",
+      "commands": [
+        "serve",
+        "bench",
+        "prompt",
+        "chat"
+      ],
+      "providers": [
+        "deepseek41",
+        "deepseek41-coder"
+      ],
+      "help": "Read routed experts from SSD through a bounded cache"
+    },
+    {
+      "name": "--expert-cache-bytes",
+      "type": "integer",
+      "commands": [
+        "serve",
+        "bench",
+        "prompt",
+        "chat"
+      ],
+      "providers": [
+        "deepseek41",
+        "deepseek41-coder"
+      ],
+      "help": "Expert cache limit in bytes; requires --stream-experts (0 = automatic)"
+    },
+    {
+      "name": "--dspark-model",
+      "type": "path",
+      "commands": [
+        "serve",
+        "bench",
+        "prompt",
+        "chat"
+      ],
+      "providers": [
+        "deepseek41",
+        "deepseek41-coder"
+      ],
+      "help": "DSpark draft model path for speculative decoding"
+    }
+  ],
   "targets": {
     "gufo_deepseek_v41_flash": {
       "requires": []
@@ -74,7 +133,7 @@
   "docs": {
     "title": "DeepSeek V4.1 Flash",
     "inputs": "Flash 1017 GGUF; text; 384 serial and Coder 1-8 sessions with DSpark",
-    "guide": "docs/models/deepseek-v4.1-flash/README.md"
+    "guide": "docs/models/deepseek-v4.1-flash.md"
   },
   "tests": [
     {

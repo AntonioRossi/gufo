@@ -144,10 +144,9 @@ void CheckScannerAndGrammar() {
   const auto schema = parse(
       R"({"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false})");
   const auto arguments =
-      Grammar::ToolParameters(schema, false, Grammar::ToolFormat::kDeepSeek41);
-  const auto required =
-      Grammar::WithTools(nullptr, {{"read", arguments}}, true, false,
-                         Grammar::ToolFormat::kDeepSeek41);
+      Grammar::ToolParameters(schema, false, ds41::DeepSeekToolGrammar());
+  const auto required = Grammar::WithTools(nullptr, {{"read", arguments}}, true,
+                                           false, ds41::DeepSeekToolGrammar());
   Expect(Accepts(*required, call) && !Accepts(*required, "DONE") &&
              !Accepts(*required, ""),
          "Required tool selection must use the V4.1 grammar");

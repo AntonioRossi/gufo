@@ -67,7 +67,8 @@ Checkpoint Capture(ds41::ContinuationAdapter& adapter, cache::Slot& slot,
                                                 ? rows * component.row_bytes
                                                 : component.state_bytes);
     if (component.row_bytes) {
-      for (cache::Rows first = 0; first < rows;) {
+      for (cache::Rows first = cache::FirstChunkRow(component, rows);
+           first < rows;) {
         const auto end = std::min(rows, first + kRowPiece);
         Wait(adapter.CopyRowsOut(
             slot, component.id, first, end,
@@ -101,8 +102,12 @@ void Load(ds41::ContinuationAdapter& adapter, cache::Slot& slot,
     const auto& component = adapter.Components()[i];
     const auto bytes = std::span<const std::byte>(checkpoint.bytes[i]);
     if (component.row_bytes) {
-      for (cache::Rows end = checkpoint.positions[i].valid_rows; end;) {
-        const auto first = end > kRowPiece ? end - kRowPiece : 0;
+      const auto retained =
+          cache::FirstChunkRow(component, checkpoint.positions[i].valid_rows);
+      for (cache::Rows end = checkpoint.positions[i].valid_rows;
+           end > retained;) {
+        const auto first =
+            std::max(retained, end > kRowPiece ? end - kRowPiece : 0);
         Wait(adapter.CopyRowsIn(
             slot, component.id, first, end,
             bytes.subspan(first * component.row_bytes,

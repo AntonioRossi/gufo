@@ -4,6 +4,7 @@
 #include <utility>
 
 #include "src/models/deepseek_v41_flash/engine.hpp"
+#include "src/models/deepseek_v41_flash/options.hpp"
 #include "src/models/deepseek_v41_flash/runner.hpp"
 
 namespace DS41_VARIANT_NAMESPACE {
@@ -97,8 +98,7 @@ std::shared_ptr<ext::TextModelRunner> LoadRunner(
   runner_options.speculative.max_draft_tokens = options.draft_tokens;
   runner_options.speculative.min_draft_tokens = options.min_draft_tokens;
 #endif
-  runner_options.stream_experts = options.stream_experts;
-  runner_options.expert_cache_bytes = options.expert_cache_bytes;
+  runner_options.provider_options = options.provider_options;
   runner_options.ram_cache.enabled = false;
   std::string error;
   auto runner = CreateDeepSeekTextRunner(runner_options, &error);
@@ -156,7 +156,7 @@ std::string Generate(const ext::TextPromptOptions& options,
     offset += step.consumed_tokens;
   }
   const auto sampling_config = sampling::ResolveTextSampling(
-      descriptor.sampling_preset, PromptReasoningOptions(options).enabled,
+      descriptor.sampling_defaults, PromptReasoningOptions(options).enabled,
       options.sampling, options.sampling_supplied);
   sampling::SamplerState sampler(sampling_config, tokens);
   if (options.verbose)

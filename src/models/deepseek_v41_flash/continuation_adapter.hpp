@@ -77,6 +77,8 @@ private:
   [[nodiscard]] Region PrivateRegion(State&, const ContinuationComponent&,
                                      std::uint32_t position) const;
   [[nodiscard]] void* RowData(State&, const ContinuationComponent&) const;
+  [[nodiscard]] Region RowRegion(State&, const ContinuationComponent&,
+                                 cache::Rows first, cache::Rows end) const;
   [[nodiscard]] cache::Completion Transfer(
       State&, bool load, cache::Stream&,
       const std::function<void(gufo::hip::TransferStream&)>&);

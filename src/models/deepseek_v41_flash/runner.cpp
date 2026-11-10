@@ -14,6 +14,7 @@
 #include "src/models/deepseek_v41_flash/continuation_adapter.hpp"
 #include "src/models/deepseek_v41_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v41_flash/engine.hpp"
+#include "src/models/deepseek_v41_flash/options.hpp"
 
 namespace DS41_VARIANT_NAMESPACE {
 namespace {
@@ -88,9 +89,7 @@ std::vector<TextRunnerToken> RunnerTokens(std::span<const int> tokens) {
 
 class Runner final : public ext::HipTextModelRunner {
 public:
-  sampling::JsonConstraint::ToolFormat ToolFormat() const override {
-    return sampling::JsonConstraint::ToolFormat::kDeepSeek41;
-  }
+  std::string ToolDialectId() const override { return "deepseek41"; }
 
   Runner(std::shared_ptr<Model> model, std::size_t session_count,
          bool use_dspark, std::uint32_t max_draft_tokens)
@@ -114,7 +113,7 @@ public:
                          .batched_multi_token_decode_max_width =
                              use_dspark_ ? 8u : 0u,
                          .prefix_reuse = true},
-        .sampling_preset = sampling::TextModelPreset::kDeepSeekV41Flash};
+        .sampling_defaults = DeepSeekSamplingDefaults()};
   }
 
   ext::TextRunnerResourceClaim ResourceClaim() const override {
@@ -193,11 +192,16 @@ public:
       std::span<const TextRunnerToken> prefix) const override {
     const std::lock_guard lock(execution_->mutex);
     auto& session = RequireState(state).session();
-    if (static_cast<std::size_t>(session.Position()) != prefix.size() ||
-        !session.CanContinue(prefix.size()))
+    if (static_cast<std::size_t>(session.Position()) != prefix.size())
       throw std::logic_error(
           "DeepSeek V4.1 prefix differs from its checkpoint");
     session.BeginRequest();
+  }
+
+  bool CanContinue(const ext::TextRunnerState& state,
+                   std::size_t prompt_tokens) const override {
+    const std::lock_guard lock(execution_->mutex);
+    return RequireState(state).session().CanContinue(prompt_tokens);
   }
 
   bool HasDecodeFrontier(const ext::TextRunnerState& state) const override {
@@ -277,12 +281,13 @@ public:
     for (const auto token : prompt.first(offset + consumed))
       prefix.push_back(EngineToken(token));
     std::string error;
-    // A retained boundary must be usable at its own position. Later growing
-    // prompts then satisfy bounded replay without a hidden full prefill.
-    if (offset && !session.CanContinue(prefix.size()))
+    const auto prompt_end = state.prefill_prompt_end() != 0
+                                ? state.prefill_prompt_end()
+                                : prefix.size();
+    // The host checks restored coverage against the complete prompt.
+    if (offset && !session.CanContinue(prompt_end))
       throw std::logic_error(
           "DeepSeek V4.1 retained prefix lacks decoder coverage");
-    const auto prompt_end = prefix.size();
     if (!session.Sync(prefix, &error, prompt_end))
       throw std::runtime_error("DeepSeek V4.1 prefill failed: " + error);
     return {.consumed_tokens = consumed,
@@ -627,8 +632,9 @@ std::shared_ptr<ext::TextModelRunner> CreateDeepSeekTextRunner(
       throw std::invalid_argument("DeepSeek V4.1 needs a valid context length");
     ModelOptions model_options;
     model_options.max_context = static_cast<std::uint32_t>(context);
-    model_options.stream_experts = options.stream_experts;
-    model_options.expert_cache_bytes = options.expert_cache_bytes;
+    const auto expert_options = ResolveExpertOptions(options.provider_options);
+    model_options.stream_experts = expert_options.stream_experts;
+    model_options.expert_cache_bytes = expert_options.expert_cache_bytes;
     model_options.dspark_model_path =
         use_dspark ? options.speculative.draft_model_path : std::string{};
     auto model = Model::Load(options.model_path, model_options, &detail);

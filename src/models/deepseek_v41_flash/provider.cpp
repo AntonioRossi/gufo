@@ -2,6 +2,7 @@
 #include <gufo/ext/registry.hpp>
 #include <gufo/ext/text.hpp>
 
+#include "src/models/deepseek_v41_flash/options.hpp"
 #include "src/models/deepseek_v41_flash/probe.hpp"
 #include "src/models/deepseek_v41_flash/variant_api.hpp"
 
@@ -20,7 +21,13 @@ void deepseek_v41_flash_provider_register(gufo::ext::Registry& registry) {
       .prompt_driver =
           &gufo::models::deepseek_v41_flash::v384::RunDeepSeekPrompt,
       .chat_driver = &gufo::models::deepseek_v41_flash::v384::RunDeepSeekChat,
-      .supports_expert_streaming = true,
+      .sampling_defaults = [](const gufo::core::GgufReader&)
+          -> std::optional<gufo::sampling::TextSamplingDefaults> {
+        return gufo::models::deepseek_v41_flash::DeepSeekSamplingDefaults();
+      },
+      .speculative_defaults = {{.backend = "dspark",
+                                .max_draft_tokens = 7,
+                                .min_draft_tokens = 1}},
   });
 #endif
 }
@@ -40,7 +47,13 @@ void deepseek_v41_flash_coder_provider_register(gufo::ext::Registry& registry) {
       .prompt_driver =
           &gufo::models::deepseek_v41_flash::coder::RunDeepSeekPrompt,
       .chat_driver = &gufo::models::deepseek_v41_flash::coder::RunDeepSeekChat,
-      .supports_expert_streaming = true,
+      .sampling_defaults = [](const gufo::core::GgufReader&)
+          -> std::optional<gufo::sampling::TextSamplingDefaults> {
+        return gufo::models::deepseek_v41_flash::DeepSeekSamplingDefaults();
+      },
+      .speculative_defaults = {{.backend = "dspark",
+                                .max_draft_tokens = 7,
+                                .min_draft_tokens = 1}},
   });
 #endif
 }

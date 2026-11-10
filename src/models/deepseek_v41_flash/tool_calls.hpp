@@ -46,6 +46,8 @@ struct DeepSeekToolSyntax {
   static constexpr std::string_view kStringAttribute = "string=\"";
 };
 
+const sampling::JsonConstraint::ToolSyntax& DeepSeekToolGrammar();
+
 /// One invocation exactly as the model wrote it, before the API surface
 /// applies a declared schema.
 using ScannedToolCall = ext::ScannedToolCall;
