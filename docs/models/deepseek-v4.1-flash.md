@@ -17,10 +17,12 @@ See [extension selection](../extensions.md).
 
 ## Execution modes
 
-The 384 variant accepts one or two serial HTTP sessions. The Coder variant
-accepts one through eight sessions. Select the count with `--sessions N`.
-The default is one session. Both variants support text, native function
-tools, and autoregressive generation.
+The 384 variant accepts one or two serial HTTP sessions without DSpark.
+With DSpark, it accepts one through eight sessions and offers batch widths
+2 through 8. The Coder variant accepts one through eight sessions with or
+without DSpark. Select the count with `--sessions N`. The default is one
+session. Both variants support text, native function tools, and
+autoregressive generation.
 
 Use `--stream-experts` to read routed experts through an SSD-backed cache.
 Use `--expert-cache-bytes N` to set its byte limit. Zero selects the runtime

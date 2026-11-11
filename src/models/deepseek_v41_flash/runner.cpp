@@ -127,11 +127,11 @@ public:
   std::vector<ext::TextExecutionPlan> SupportedPlans() const override {
     std::vector<ext::TextExecutionPlan> plans{
         {.kind = ext::TextExecutionPlanKind::kSerial, .physical_width = 1}};
-#if DS41_VARIANT_CODER
-    for (std::size_t width = 2; width <= 8; ++width)
-      plans.push_back({.kind = ext::TextExecutionPlanKind::kBatched,
-                       .physical_width = width});
-#endif
+    if (DS41_VARIANT_CODER || use_dspark_) {
+      for (std::size_t width = 2; width <= 8; ++width)
+        plans.push_back({.kind = ext::TextExecutionPlanKind::kBatched,
+                         .physical_width = width});
+    }
     return plans;
   }
 
@@ -604,7 +604,7 @@ std::shared_ptr<ext::TextModelRunner> CreateDeepSeekTextRunner(
       throw std::invalid_argument(
           "DeepSeek V4.1 requires disabled speculation or DSpark with a "
           "drafter and default draft controls");
-    if (options.session_count > 2)
+    if (!use_dspark && options.session_count > 2)
       throw std::invalid_argument("DeepSeek V4.1 requires one or two sessions");
 #endif
     if (!options.vision_model_path.empty())
