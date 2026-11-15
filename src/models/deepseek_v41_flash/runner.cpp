@@ -94,6 +94,7 @@ public:
   Runner(std::shared_ptr<Model> model, std::size_t session_count,
          bool use_dspark, std::uint32_t max_draft_tokens)
       : execution_(std::make_shared<Execution>()),
+        session_count_(session_count),
         use_dspark_(use_dspark),
         max_draft_tokens_(std::max(max_draft_tokens, 1u)) {
     execution_->model = std::move(model);
@@ -113,7 +114,12 @@ public:
                          .batched_multi_token_decode_max_width =
                              use_dspark_ ? 8u : 0u,
                          .prefix_reuse = true},
-        .sampling_defaults = DeepSeekSamplingDefaults()};
+        .sampling_defaults = DeepSeekSamplingDefaults(),
+        // Keep the existing pass limit beside decoders. Native prefill holds
+        // the execution lock and does not yield between layers.
+        .scheduling = {.pass_tokens = 512,
+                       .max_layer_groups = 1,
+                       .max_yield_decode_width = 1}};
   }
 
   ext::TextRunnerResourceClaim ResourceClaim() const override {
@@ -225,8 +231,17 @@ public:
   }
 
   std::unique_ptr<ext::ComponentCacheResources> CreateComponentCacheResources(
-      cache::ResourceLedger& ledger, std::size_t) const override {
+      cache::ResourceLedger& ledger, std::size_t ram_bytes) const override {
+    return CreateComponentCacheResourcesForSessions(ledger, ram_bytes,
+                                                    session_count_);
+  }
+
+  std::unique_ptr<ext::ComponentCacheResources>
+  CreateComponentCacheResourcesForSessions(
+      cache::ResourceLedger& ledger, std::size_t,
+      std::size_t sessions) const override {
     const std::lock_guard lock(execution_->mutex);
+    const auto transfers = hip::PlanComponentTransfers(sessions);
     const auto address =
         reinterpret_cast<std::uintptr_t>(execution_->model.get());
     const auto* bytes = reinterpret_cast<const std::uint8_t*>(&address);
@@ -243,7 +258,8 @@ public:
             std::move(execution_->idle)),
         ledger,
         {[] { return ext::HostSnapshotCeilingBytes(); },
-         [](std::string_view) {}, [](std::string_view) {}});
+         [](std::string_view) {}, [](std::string_view) {},
+         transfers.native_streams, transfers.leases});
   }
 
   std::unique_ptr<ext::TextRunnerState> BindComponentState(
@@ -560,6 +576,7 @@ private:
   }
 
   std::shared_ptr<Execution> execution_;
+  std::size_t session_count_;
   bool use_dspark_;
   std::uint32_t max_draft_tokens_;
 };

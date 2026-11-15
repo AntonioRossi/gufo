@@ -159,8 +159,16 @@ bool Executor::HcMixBatch(const DeviceMixer& m, const float* res, bool normed,
   half_src_ = nullptr;
   // Keep each row's scalar epilogue/reduction independently of the total
   // row count, including prompt replay and concatenated decode batches.
+  // Decode-sized projections can consume the epilogue's exact Q8_1 rows.
+  // Wider batches retain their existing tiled/padded quantization route.
+  const bool q8 = rows <= kDecodeRows && c.hidden_size % 32 == 0 &&
+                  qfn_mmq_q8_1_bytes(1, static_cast<int>(c.hidden_size)) ==
+                      c.hidden_size / 32 * 36;
   HcMixEpilogue(s_.xn, s_.hc_gate, fused_inject ? m.inject.f32() : nullptr,
-                mixed, inject, rows, c.hidden_size, c.hc_count, stream_);
+                mixed, inject, rows, c.hidden_size, c.hc_count, stream_,
+                q8 ? s_.mixed_q8_1 : nullptr);
+  if (q8)
+    mixed_q8_ready_ = {mixed, s_.mixed_q8_1, rows, c.hidden_size};
   inject_parts_ = fused_inject ? HcInjectParts(c.hidden_size) : 1;
   if (inject != nullptr && !m.inject.empty() && !fused_inject) {
     if (!DenseBatch(m.inject, s_.xn, inject, rows, error))
@@ -391,10 +399,16 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
     if (compact_tail) {
       tail.mtp_res = base.res;
       tail.ctx = base.qg;
-      tail.inject = base.mtp_h;
+      // Inject rows move down within their own buffer (rows only move to
+      // lower indices, so the in-order copies never overwrite a pending
+      // source). base.mtp_h aliases s_.xn, which the FFN combine writes
+      // while its blocks still read the inject partials.
+      tail.inject = base.inject;
       for (std::size_t i = 0; i < items.size(); ++i) {
         const auto r = final_rows[i];
         const auto copy = [&](float* dst, const float* src, std::size_t width) {
+          if (dst + i * width == src + r * width)
+            return true;  // the row is already in place
           return Check(hipMemcpyAsync(dst + i * width, src + r * width,
                                       width * sizeof(float),
                                       hipMemcpyDeviceToDevice, stream_),
@@ -576,10 +590,18 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
       if (!DenseBatch(full_head, base.mixed, batch_logits_, n, error))
         return false;
       for (std::uint32_t i = 0; i < n; ++i) {
-        if (slot[i] < subset_rows)
-          GatherDraftLogits(logits_of(i), items[i].session->mtp_.draft_ids,
-                            static_cast<std::uint32_t>(prefix),
-                            speculative::kDraftVocabExtraRows, stream_);
+        if (slot[i] >= subset_rows)
+          continue;
+        GatherDraftLogits(logits_of(i), items[i].session->mtp_.draft_ids,
+                          static_cast<std::uint32_t>(prefix),
+                          speculative::kDraftVocabExtraRows, stream_);
+        // A requantized prefix scores its rows as alone; the table rows
+        // above keep the full head's values either way.
+        if (prefix_head.data != full_head.data &&
+            !Dense(prefix_head,
+                   base.mixed + std::size_t{slot[i]} * full_head.cols,
+                   logits_of(i), 1, error))
+          return false;
       }
     } else if (subset_rows != 0) {
       float* staged = batch_logits_ + kBatchSessions * vocab -
@@ -1238,10 +1260,23 @@ bool Executor::ForwardBatchImpl(std::span<const BatchItem> items, bool wide,
                       error)) {
         return false;
       }
-      CombineBatch(base.res, l.hc_ffn.norm.f32(), rows);
-      if (!HcMixBatch(l.hc_ffn, base.res, true, base.mixed, base.inject, rows,
-                      error))
-        return false;
+      // This immediate combine/mix pair has no intervening residual reader.
+      // Reuse the scalar route's existing exact fused decode implementation;
+      // wider rows and deferred/other-format states keep the batched path.
+      if (rows != 0 && FusedMixer(l.hc_ffn, rows) &&
+          pending_combine_.mixer == nullptr && !res_deferred_ &&
+          !defer_residual_ && !moe_pending_) {
+        DropReadyQ8();
+        Combine(base.res, l.hc_ffn.norm.f32(), rows, nullptr, &l.hc_ffn);
+        if (!HcMix(l.hc_ffn, base.res, true, base.mixed, base.inject, rows,
+                   error))
+          return false;
+      } else {
+        CombineBatch(base.res, l.hc_ffn.norm.f32(), rows);
+        if (!HcMixBatch(l.hc_ffn, base.res, true, base.mixed, base.inject, rows,
+                        error))
+          return false;
+      }
       if (!MoeBatch(l, base.mixed, base.block_out, rows, error))
         return false;
       const float* next_norm =

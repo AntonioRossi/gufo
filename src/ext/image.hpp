@@ -6,6 +6,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -25,9 +26,28 @@ struct ImageMetrics {
   double prompt_ms{0};
   double denoise_ms{0};
   double vae_ms{0};
-  double total_ms{0};
+  double total_ms{0};  // Includes lora_ms.
   std::size_t resident_weight_bytes{0};
-  int steps{0};  // Denoising steps executed after resolving the default.
+  int steps{0};       // Denoising steps executed after resolving the default.
+  double lora_ms{0};  // Adapter switch, before prompt encoding.
+  /// Classifier-free guidance scale applied after resolving the default
+  /// (at most 1 is unguided); nullopt when the runner does not report it.
+  std::optional<float> guidance_scale{};
+};
+
+/// A LoRA adapter registered with ImageRunner::AddLora, selected by name; the
+/// scale multiplies the adapter's own alpha/rank.
+struct ImageLora {
+  std::string name;
+  float scale{1};
+  bool operator==(const ImageLora&) const = default;
+};
+
+struct ImageLoraInfo {
+  std::string format;
+  std::size_t targets{0};  // Base weights the adapter patches.
+  int min_rank{0};
+  int max_rank{0};
 };
 
 /// Caller's background intent, forwarded unchanged from the HTTP request.
@@ -48,6 +68,22 @@ struct ImageRequest {
   int steps{0};
   std::uint64_t seed{0};
   ImageBackground background{ImageBackground::kAuto};
+  // Applied in order; scale 0 entries are ignored.
+  std::vector<ImageLora> loras{};
+  /// Classifier-free guidance: text the result should move away from, and
+  /// the scale in [0, 100]. nullopt selects the runner's default for the
+  /// given `negative_prompt`; a scale of at most 1 keeps a single unguided
+  /// pass. Requires `ImageCapabilities::guidance` when `negative_prompt` is
+  /// non-empty or the scale is above 1.
+  std::string negative_prompt{};
+  std::optional<float> guidance_scale{};
+  /// Image to image: the start image and the share of the `steps` schedule
+  /// that denoises it, in [0.01, 1], as Diffusers' img2img `strength` (the
+  /// last `steps * strength` steps run). 1 starts from pure noise (the start
+  /// image only sets the canvas of a size "auto" request). Below 1 requires
+  /// `init_image` and `ImageCapabilities::image_to_image`.
+  std::optional<ImageBuffer> init_image{};
+  double strength{1};
 };
 
 /// Request features a runner accepts beyond text-to-image generation. The
@@ -58,6 +94,19 @@ struct ImageCapabilities {
   bool edits{false};
   /// Accepts `ImageBackground::kTransparent`.
   bool transparent_background{false};
+  /// Accepts `negative_prompt` and `guidance_scale` (classifier-free
+  /// guidance).
+  bool guidance{false};
+  /// Accepts `init_image` with `strength` below 1.
+  bool image_to_image{false};
+};
+
+/// Thrown by `ImageRunner::Generate` when the request does not fit into the
+/// device memory free now; it may fit later or with fewer inputs. The host
+/// answers HTTP 503 and keeps serving.
+class ImageResourceError : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
 };
 
 struct ImageResult {
@@ -88,6 +137,24 @@ public:
   virtual void ValidateRequest(const ImageRequest& request) const {
     (void)request;
   }
+
+  /// Validate and register an adapter before serving. Runners without
+  /// adapter support reject every adapter.
+  virtual ImageLoraInfo AddLora(const std::string& name,
+                                const std::string& path) {
+    (void)path;
+    throw std::invalid_argument(
+        "this image model does not support LoRA "
+        "adapters: " +
+        name);
+  }
+  /// Adapters applied to the weights now; empty while a switch is unfinished.
+  [[nodiscard]] virtual std::vector<ImageLora> ActiveLoras() const {
+    return {};
+  }
+  /// True after a failed request left the device context unusable; the host
+  /// then reports the device as lost so the process can be restarted.
+  [[nodiscard]] virtual bool DeviceLost() const { return false; }
 };
 
 /// Command whose manifest options reach an image provider. A declaration for

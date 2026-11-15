@@ -5,21 +5,27 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <numeric>
 #include <semaphore>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
 
+#include "src/cache/disk.hpp"
 #include "src/cache/retention.hpp"
 #include "src/cli/serve/component_cache_metrics.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
+#include "src/core/hip/component_cache_resources.hpp"
 #include "tests/cache/fake_adapter.hpp"
 #include "tests/cli/fake_cache_resources.hpp"
 #include "tests/support/temporary_directory.hpp"
@@ -40,7 +46,9 @@ class Runner : public TextModelRunner {
 public:
   mutable FakeAdapter* adapter{};
   mutable std::size_t captures{};
+  std::function<void()> on_bind;
   bool defer_idle{};
+  bool check_capacity{};
   bool in_pass{};
   bool partial{};
   std::size_t alignment{1};
@@ -101,10 +109,13 @@ public:
         {.private_blocks = private_blocks,
          .row_backing_bytes = row_backing_bytes,
          .defer_idle = &defer_idle,
-         .captures = &captures});
+         .captures = &captures,
+         .check_capacity = check_capacity});
   }
   std::unique_ptr<TextRunnerState> BindComponentState(
       cache::Adapter& adapter, cache::Slot& slot) const override {
+    if (on_bind)
+      on_bind();
     return std::make_unique<State>(dynamic_cast<FakeAdapter&>(adapter), slot);
   }
   void ReconcileComponentState(TextRunnerState& state,
@@ -174,6 +185,287 @@ public:
     return s.adapter.Positions(s.slot).front().valid_rows;
   }
 };
+thread_local bool transfer_foreground_caller{};
+
+// Counts real serving acquisitions, without pretending that FakeStream models
+// native HIP memory. The physical pool and its fences have separate fake-HIP
+// regressions; this fixture exercises the production consumer bound.
+struct BoundedTransfers : std::enable_shared_from_this<BoundedTransfers> {
+  explicit BoundedTransfers(std::size_t capacity) : capacity(capacity) {}
+  struct Owner {
+    std::shared_ptr<BoundedTransfers> pool;
+    ~Owner() {
+      const std::lock_guard lock(pool->mutex);
+      assert(pool->live);
+      --pool->live;
+    }
+  };
+  const std::size_t capacity;
+  const std::thread::id main{std::this_thread::get_id()};
+  std::mutex mutex;
+  std::condition_variable changed;
+  std::size_t live{}, peak{}, refused{};
+  std::size_t rendezvous_width{}, participants{}, entered{};
+  std::map<std::thread::id, std::size_t> thread_acquisitions;
+  bool hold_background{}, background_submitted{};
+
+  struct Usage {
+    std::size_t live, peak, refused;
+  };
+  Usage Snapshot() {
+    const std::lock_guard lock(mutex);
+    return {live, peak, refused};
+  }
+
+  std::unique_ptr<cache::Stream> Acquire() {
+    const bool foreground =
+        std::this_thread::get_id() == main || transfer_foreground_caller;
+    std::shared_ptr<Owner> owner;
+    {
+      std::unique_lock lock(mutex);
+      if (live == capacity) {
+        ++refused;
+        return {};
+      }
+      owner = std::make_shared<Owner>(shared_from_this());
+      peak = std::max(peak, ++live);
+      if (transfer_foreground_caller && rendezvous_width &&
+          ++thread_acquisitions[std::this_thread::get_id()] ==
+              rendezvous_width) {
+        ++entered;
+        changed.notify_all();
+        assert(changed.wait_for(lock, std::chrono::seconds(5),
+                                [&] { return entered == participants; }));
+      }
+    }
+    return std::make_unique<FakeStream>(
+        true, std::move(owner),
+        foreground ? std::function<void()>{} : [self = shared_from_this()] {
+          std::unique_lock lock(self->mutex);
+          if (!self->hold_background)
+            return;
+          self->background_submitted = true;
+          self->changed.notify_all();
+          self->changed.wait(lock, [&] { return !self->hold_background; });
+        });
+  }
+  void Rendezvous(std::size_t count, std::size_t width) {
+    const std::lock_guard lock(mutex);
+    participants = count;
+    rendezvous_width = width;
+    entered = 0;
+    thread_acquisitions.clear();
+  }
+  void BlockBackground() {
+    const std::lock_guard lock(mutex);
+    hold_background = true;
+    background_submitted = false;
+  }
+  void WaitForBackground() {
+    std::unique_lock lock(mutex);
+    assert(changed.wait_for(lock, std::chrono::seconds(5),
+                            [&] { return background_submitted; }));
+  }
+  void ReleaseBackground() {
+    const std::lock_guard lock(mutex);
+    hold_background = false;
+    changed.notify_all();
+  }
+};
+
+class TransferRunner final : public Runner {
+public:
+  mutable std::size_t sessions{};
+  mutable std::shared_ptr<BoundedTransfers> transfers;
+  bool copy_chunks{true};
+  std::unique_ptr<ComponentCacheResources>
+  CreateComponentCacheResourcesForSessions(cache::ResourceLedger& ledger,
+                                           std::size_t ram,
+                                           std::size_t count) const override {
+    sessions = count;
+    const auto plan = hip::PlanComponentTransfers(count);
+    transfers = std::make_shared<BoundedTransfers>(plan.leases);
+    auto resources = Runner::CreateComponentCacheResources(ledger, ram);
+    resources->stream = [pool = transfers] { return pool->Acquire(); };
+    resources->transfer_batch_size = 16;
+    const auto allocations = std::make_shared<std::mutex>();
+    resources->allocate =
+        [allocate = resources->allocate, allocations,
+         copy = copy_chunks](const cache::PayloadRequest& request) {
+          const std::lock_guard lock(*allocations);
+          auto buffer = allocate(request);
+          if (copy) {
+            buffer.borrow = {};
+            buffer.allocation = nullptr;
+          }
+          return buffer;
+        };
+    return resources;
+  }
+};
+
+void TransferProviderCompatibility() {
+  class Legacy final : public Runner {
+  public:
+    mutable std::size_t called{};
+    std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
+        cache::ResourceLedger& ledger, std::size_t ram) const override {
+      ++called;
+      return Runner::CreateComponentCacheResources(ledger, ram);
+    }
+  };
+  auto legacy = std::make_shared<Legacy>();
+  {
+    ComponentTextCache cache(legacy, 4, 1 << 22, {});
+  }
+  assert(legacy->called == 1);
+  for (const std::size_t count : {1U, 2U, 4U, 7U}) {
+    auto runner = std::make_shared<TransferRunner>();
+    {
+      ComponentTextCache cache(runner, count, 1 << 22, {});
+      assert(runner->sessions == count);
+      assert(runner->transfers->capacity ==
+             hip::PlanComponentTransfers(count).leases);
+      assert(runner->transfers->Snapshot().live == count);
+    }
+    assert(!runner->transfers->Snapshot().live &&
+           !runner->transfers->Snapshot().refused);
+  }
+}
+
+void ConcurrentBoundedTransfers() {
+  constexpr std::size_t count = 4;
+  auto runner = std::make_shared<TransferRunner>();
+  {
+    ComponentTextCache cache(runner, count, 1 << 22, {});
+    std::array<std::vector<TextRunnerToken>, count> prompts;
+    std::array<std::unique_ptr<ComponentTextCache::Lease>, count> leases;
+    std::array<std::unique_ptr<ContinuationSnapshot>, count> snapshots;
+    std::array<std::uint64_t, count> hashes{};
+    for (std::size_t i = 0; i < count; ++i) {
+      prompts[i].resize(80);
+      std::iota(prompts[i].begin(), prompts[i].end(), 1000 * (i + 1));
+      leases[i] = cache.Acquire(prompts[i], {}, {}, true, 0, true);
+      auto& state = dynamic_cast<State&>(leases[i]->state());
+      runner->adapter->Append(state.slot, prompts[i], prompts[i]);
+      hashes[i] = runner->adapter->RecurrentHash(state.slot);
+      assert(leases[i]->TryReserveSnapshot(leases[i]->CaptureBytes(),
+                                           prompts[i].size(), false,
+                                           SnapshotPurpose::kContinuation, {}));
+    }
+    // All four typed callers hold a complete 16-transfer batch simultaneously.
+    // The batch exceeds the five physical lanes but fits the derived logical
+    // event capacity. A mere native-pool reduction would refuse here.
+    runner->transfers->Rendezvous(count, 16);
+    std::array<std::future<void>, count> calls;
+    for (std::size_t i = 0; i < count; ++i)
+      calls[i] = std::async(std::launch::async, [&, i] {
+        transfer_foreground_caller = true;
+        snapshots[i] = leases[i]->Capture();
+        transfer_foreground_caller = false;
+      });
+    for (auto& call : calls)
+      call.get();
+    runner->transfers->Rendezvous(0, 0);
+    assert(runner->transfers->Snapshot().peak >= count + count * 16);
+    assert(!runner->transfers->Snapshot().refused);
+    for (std::size_t i = 0; i < count; ++i) {
+      assert(leases[i]->PublishSnapshot(prompts[i], std::move(snapshots[i]),
+                                        false));
+      leases[i]->Invalidate();
+    }
+    for (std::size_t i = 0; i < count; ++i)
+      calls[i] = std::async(std::launch::async, [&, i] {
+        transfer_foreground_caller = true;
+        auto restored = cache.Acquire(prompts[i], {}, {}, true, 0, true);
+        assert(restored->cached_tokens() == prompts[i].size());
+        assert(restored->restored_snapshot_bytes() &&
+               !restored->restored_from_disk());
+        assert(runner->adapter->RecurrentHash(
+                   dynamic_cast<State&>(restored->state()).slot) == hashes[i]);
+        restored->Invalidate();
+        transfer_foreground_caller = false;
+      });
+    for (auto& call : calls)
+      call.get();
+    assert(runner->transfers->Snapshot().peak <= runner->transfers->capacity);
+    assert(!runner->transfers->Snapshot().refused);
+  }
+  assert(!runner->transfers->Snapshot().live);
+}
+
+void BoundedTransferDiskProgress() {
+  const TemporaryDirectory temp("gufo-bounded-transfers-test");
+  const TextRunnerDiskCacheOptions disk{.directory = temp.path(),
+                                        .capacity_bytes = 1 << 20};
+  std::vector<TextRunnerToken> prompt(80);
+  std::iota(prompt.begin(), prompt.end(), 10);
+  std::uint64_t expected{};
+  auto runner = std::make_shared<TransferRunner>();
+  runner->copy_chunks = false;
+  {
+    ComponentTextCache cache(runner, 4, 1 << 22, disk);
+    auto source = cache.Acquire(prompt, {}, {}, true, 0, true);
+    auto& state = dynamic_cast<State&>(source->state());
+    runner->adapter->Append(state.slot, prompt, prompt);
+    expected = runner->adapter->RecurrentHash(state.slot);
+    assert(source->TryReserveSnapshot(source->CaptureBytes(), prompt.size(),
+                                      false, SnapshotPurpose::kContinuation,
+                                      {}));
+    auto snapshot = source->Capture();
+    runner->transfers->BlockBackground();
+    struct ReleaseBackground {
+      std::shared_ptr<BoundedTransfers> transfers;
+      ~ReleaseBackground() { transfers->ReleaseBackground(); }
+    } release{runner->transfers};
+    assert(source->PublishSnapshot(prompt, std::move(snapshot), false));
+    assert(source->Metrics().disk_queued_bytes);
+    (void)source->Commit({}, {}, prompt);
+    // Either the idle worker or the durable writer has submitted a real fake
+    // copy and is waiting for its controlled completion before foreground
+    // activity starts. It keeps its source and lease throughout the overlap.
+    runner->transfers->WaitForBackground();
+    const std::vector<TextRunnerToken> other(80, 999);
+    auto foreground = cache.Acquire(other, {}, {}, true, 0, true);
+    auto& target = dynamic_cast<State&>(foreground->state());
+    runner->adapter->Append(target.slot, other, other);
+    assert(foreground->TryReserveSnapshot(foreground->CaptureBytes(),
+                                          other.size(), false,
+                                          SnapshotPurpose::kContinuation, {}));
+    assert(foreground->PublishSnapshot(other, foreground->Capture(), false));
+    assert(runner->transfers->Snapshot().live >= 5 &&
+           !runner->transfers->Snapshot().refused);
+    runner->transfers->ReleaseBackground();
+    foreground->Invalidate();
+  }  // Drains idle preservation and durable publication before restart.
+  assert(!runner->transfers->Snapshot().live &&
+         !runner->transfers->Snapshot().refused);
+  {
+    auto restored_runner = std::make_shared<TransferRunner>();
+    restored_runner->copy_chunks = false;
+    ComponentTextCache cache(restored_runner, 1, 1 << 22, disk);
+    auto restored = cache.Acquire(prompt, {}, {}, true, 0, true);
+    assert(restored->restored_from_disk() &&
+           restored->cached_tokens() == prompt.size());
+    assert(restored_runner->adapter->RecurrentHash(
+               dynamic_cast<State&>(restored->state()).slot) == expected);
+    (void)restored->Commit({}, {}, prompt);
+    // A one-slot cache must reassign the restored slot for unrelated work.
+    // Its subsequent restore validates retained data rather than metadata only.
+    const std::vector<TextRunnerToken> cold(20, 333);
+    auto replacement = cache.Acquire(cold, {}, {}, false, 0, true);
+    assert(!replacement->cache_hit());
+    restored_runner->adapter->Append(
+        dynamic_cast<State&>(replacement->state()).slot, cold, cold);
+    replacement->Invalidate();
+    auto retry = cache.Acquire(prompt, {}, {}, true, 0, true);
+    assert(retry->cached_tokens() == prompt.size());
+    assert(restored_runner->adapter->RecurrentHash(
+               dynamic_cast<State&>(retry->state()).slot) == expected);
+    retry->Invalidate();
+    assert(!restored_runner->transfers->Snapshot().refused);
+  }
+}
 void BudgetUsesAllocatedSlotsInsteadOfLazyStateClaim() {
   class BudgetRunner final : public Runner {
   public:
@@ -1167,8 +1459,14 @@ void ReuseAndBranches() {
   assert(Generate(peer) == token);
   (void)peer.Commit();
   (void)retry.Commit();
-  runner->adapter->FailNextTransfer();
+  // Inject at the foreground bind, after optional idle frontier work settles.
+  const auto foreground = std::this_thread::get_id();
+  runner->on_bind = [&, foreground] {
+    if (std::this_thread::get_id() == foreground)
+      runner->adapter->FailNextTransfer();
+  };
   auto failed_restore = pool.Acquire(prompt);
+  runner->on_bind = {};
   assert(!failed_restore.cache_hit());
   Prefill(failed_restore);
   assert(Generate(failed_restore) == token);
@@ -1306,6 +1604,223 @@ void WarmTurnsAdvanceTheStableCheckpoint() {
          "successive rewritten turns resume from the latest boundary");
   (void)fourth.Cancel();
 }
+void GeneratedFrontierKeepsTheCurrentRetryUnderPressure() {
+  auto runner = std::make_shared<Runner>();
+  runner->private_blocks = 1;
+  ComponentTextCache cache(runner, 1, 1 << 22, {});
+  const std::vector<TextRunnerToken> prompt{1, 2, 3, 4};
+  auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+  auto& state = dynamic_cast<State&>(lease->state());
+  runner->adapter->Append(state.slot, prompt, prompt);
+  const auto expected = runner->adapter->RecurrentHash(state.slot);
+  assert(lease->TryReserveSnapshot(lease->CaptureBytes(), prompt.size(), false,
+                                   SnapshotPurpose::kRetry));
+  assert(lease->PublishSnapshot(prompt, lease->Capture()));
+  const std::vector<TextRunnerToken> output{50, 51, 52, 53};
+  runner->adapter->Append(state.slot, output, output);
+  auto frontier = prompt;
+  frontier.insert(frontier.end(), output.begin(), output.end());
+  (void)lease->Commit({}, {}, frontier);
+  auto peer =
+      cache.Acquire(std::vector<TextRunnerToken>{90}, {}, {}, true, 0, true);
+  peer->Invalidate();
+  auto retry = cache.Acquire(prompt, {}, {}, true, 0, true);
+  assert(retry->cached_tokens() == prompt.size());
+  assert(runner->adapter->RecurrentHash(
+             dynamic_cast<State&>(retry->state()).slot) == expected);
+  // Reusing the exact checkpoint does not publish a new prompt snapshot.
+  // It still needs the same protection when this retry finishes generating.
+  runner->adapter->Append(dynamic_cast<State&>(retry->state()).slot, output,
+                          output);
+  (void)retry->Commit({}, {}, frontier);
+  peer = cache.Acquire(std::vector<TextRunnerToken>{91}, {}, {}, true, 0, true);
+  peer->Invalidate();
+  auto repeated = cache.Acquire(prompt, {}, {}, true, 0, true);
+  assert(repeated->cached_tokens() == prompt.size());
+  repeated->Invalidate();
+}
+void OptionalFrontiersLeaveTheNextPromptACompleteCapture() {
+  const TemporaryDirectory temp("gufo-frontier-headroom-test");
+  for (bool disk_on : {false, true}) {
+    auto runner = std::make_shared<Runner>();
+    runner->private_blocks = 2;
+    runner->check_capacity = true;
+    const std::optional<TextRunnerDiskCacheOptions> disk =
+        disk_on ? std::optional(TextRunnerDiskCacheOptions{
+                      .directory = temp.path().string(),
+                      .capacity_bytes = 1 << 20,
+                      .min_checkpoint_step_tokens = 0})
+                : std::nullopt;
+    {
+      ComponentTextCache cache(runner, 1, 1 << 22, disk);
+      const std::vector<TextRunnerToken> prompt{1, 2, 3, 4};
+      auto first = cache.Acquire(prompt, {}, {}, true, 0, true);
+      auto& state = dynamic_cast<State&>(first->state());
+      runner->adapter->Append(state.slot, prompt, prompt);
+      assert(first->TryReserveSnapshot(first->CaptureBytes(), prompt.size(),
+                                       false, SnapshotPurpose::kRetry));
+      assert(first->PublishSnapshot(prompt, first->Capture()));
+      const std::vector<TextRunnerToken> tail{5, 6, 7, 8};
+      runner->adapter->Append(state.slot, tail, tail);
+      auto frontier = prompt;
+      frontier.insert(frontier.end(), tail.begin(), tail.end());
+      (void)first->Commit({}, {}, frontier);
+      const std::vector<TextRunnerToken> other{90, 91, 92, 93};
+      auto peer = cache.Acquire(other, {}, {}, true, 0, true);
+      runner->adapter->Append(dynamic_cast<State&>(peer->state()).slot, other,
+                              other);
+      assert(peer->TryReserveSnapshot(peer->CaptureBytes(), other.size(), false,
+                                      SnapshotPurpose::kRetry));
+      assert(peer->PublishSnapshot(other, peer->Capture()));
+      peer->Invalidate();
+      // The optional copy did not consume the last private-state block and
+      // force the next unrelated prompt to evict the previous exact retry.
+      auto retry = cache.Acquire(prompt, {}, {}, true, 0, true);
+      assert(retry->cached_tokens() == prompt.size());
+      retry->Invalidate();
+    }
+    if (disk_on) {
+      cache::ResourceLedger ledger({1 << 24, 1 << 24, 1 << 20, 1 << 20});
+      cache::DiskStore store(ledger, temp.path(), 1 << 20);
+      for (const auto& entry : store.Entries())
+        assert(entry.Manifest().purpose !=
+               cache::CheckpointPurpose::kGenerated);
+    }
+  }
+}
+void PromptCaptureReclaimsUnusedGeneratedStateFirst() {
+  auto runner = std::make_shared<Runner>();
+  runner->private_blocks = 2;
+  ComponentTextCache cache(runner, 1, 1 << 22, {});
+  const std::vector<TextRunnerToken> prompt{1, 2, 3, 4};
+  auto first = cache.Acquire(prompt, {}, {}, true, 0, true);
+  auto& state = dynamic_cast<State&>(first->state());
+  runner->adapter->Append(state.slot, prompt, prompt);
+  assert(first->TryReserveSnapshot(first->CaptureBytes(), prompt.size(), false,
+                                   SnapshotPurpose::kRetry));
+  assert(first->PublishSnapshot(prompt, first->Capture()));
+  const std::vector<TextRunnerToken> output{50, 51, 52, 53};
+  runner->adapter->Append(state.slot, output, output);
+  auto frontier = prompt;
+  frontier.insert(frontier.end(), output.begin(), output.end());
+  (void)first->Commit({}, {}, frontier);
+  const std::vector<TextRunnerToken> other{90, 91, 92, 93};
+  auto peer = cache.Acquire(other, {}, {}, true, 0, true);
+  runner->adapter->Append(dynamic_cast<State&>(peer->state()).slot, other,
+                          other);
+  assert(peer->TryReserveSnapshot(peer->CaptureBytes(), other.size(), false,
+                                  SnapshotPurpose::kRetry));
+  assert(peer->PublishSnapshot(other, peer->Capture()));
+  peer->Invalidate();
+  auto retry = cache.Acquire(prompt, {}, {}, true, 0, true);
+  assert(retry->cached_tokens() == prompt.size());
+  retry->Invalidate();
+}
+void IdleFrontierCaptureReturnsBeforeCopyAndAdmissionWaits() {
+  auto runner = std::make_shared<Runner>();
+  ComponentTextCache cache(runner, 1, 1 << 22, {});
+  const std::vector<TextRunnerToken> prompt{1, 2, 3};
+  const std::vector<TextRunnerToken> frontier{1, 2, 3, 4, 5};
+  auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+  (void)runner->Prefill(dynamic_cast<TextRunnerState&>(lease->state()), prompt,
+                        0, prompt.size());
+  runner->Advance(dynamic_cast<TextRunnerState&>(lease->state()), 4);
+  runner->Advance(dynamic_cast<TextRunnerState&>(lease->state()), 5);
+  std::binary_semaphore entered(0), finish(0);
+  std::atomic<unsigned> binds{};
+  runner->on_bind = [&] {
+    if (binds.fetch_add(1) == 0) {
+      entered.release();
+      finish.acquire();
+    }
+  };
+  (void)lease->Commit({}, {}, frontier);
+  // Commit returned even though its idle task cannot yet bind/copy the slot.
+  entered.acquire();
+  auto next = std::async(std::launch::async, [&] {
+    return cache.Acquire(std::vector<TextRunnerToken>{9}, {}, {}, true, 0,
+                         true);
+  });
+  const auto waiting = next.wait_for(std::chrono::milliseconds(20));
+  finish.release();
+  assert(waiting == std::future_status::timeout);
+  auto peer = next.get();
+  peer->Invalidate();
+  auto replay = cache.Acquire(frontier, {}, {}, true, 0, true);
+  assert(replay->cached_tokens() == frontier.size());
+  replay->Invalidate();
+}
+void IdleFrontierSetupRefusalKeepsTheCompletedLiveExecution() {
+  auto runner = std::make_shared<Runner>();
+  ComponentTextCache cache(runner, 1, 1 << 22, {});
+  const std::vector<TextRunnerToken> prompt{1, 2, 3};
+  const std::vector<TextRunnerToken> frontier{1, 2, 3, 4};
+  auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+  auto& state = dynamic_cast<State&>(lease->state());
+  runner->adapter->Append(state.slot, frontier, frontier);
+  const auto expected = runner->adapter->RecurrentHash(state.slot);
+  std::atomic<unsigned> binds{};
+  runner->on_bind = [&] {
+    if (binds.fetch_add(1) == 0)
+      throw cache::ResourceExhausted();
+  };
+  (void)lease->Commit({}, {}, frontier);
+  auto next = cache.Acquire(frontier, {}, {}, true, 0, true);
+  assert(next->cached_tokens() == frontier.size());
+  assert(next->restored_snapshot_bytes() == 0);
+  assert(runner->adapter->RecurrentHash(
+             dynamic_cast<State&>(next->state()).slot) == expected);
+  next->Invalidate();
+}
+void GeneratedFrontierSurvivesReassignmentAndRestart() {
+  for (const bool disk_on : {false, true}) {
+    const TemporaryDirectory temp("gufo-generated-frontier");
+    const auto disk = disk_on ? std::optional<TextRunnerDiskCacheOptions>(
+                                    {.directory = temp.path().string(),
+                                     .capacity_bytes = 1 << 20,
+                                     .min_checkpoint_step_tokens = 2048})
+                              : std::nullopt;
+    auto runner = std::make_shared<Runner>();
+    runner->alignment = 4;
+    const std::vector<TextRunnerToken> prompt{1, 2, 3, 4};
+    const std::vector<TextRunnerToken> frontier{1, 2, 3, 4, 50, 51, 52};
+    auto continuation = frontier;
+    continuation.push_back(60);
+    std::uint64_t expected{};
+    {
+      ComponentTextCache cache(runner, 1, 1 << 22, disk);
+      auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+      auto& state = dynamic_cast<State&>(lease->state());
+      runner->adapter->Append(state.slot, prompt, prompt);
+      assert(lease->TryReserveSnapshot(lease->CaptureBytes(), prompt.size()));
+      assert(lease->PublishSnapshot(prompt, lease->Capture()));
+      const auto generated = std::span(frontier).subspan(prompt.size());
+      runner->adapter->Append(state.slot, generated, generated);
+      expected = runner->adapter->RecurrentHash(state.slot);
+      (void)lease->Commit({}, {}, frontier);
+      lease.reset();
+      // With one slot this destroys the live frontier. Its retained copy must
+      // still include the output, even though it is below the disk step.
+      auto peer = cache.Acquire(std::vector<TextRunnerToken>{90, 91}, {}, {},
+                                true, 0, true);
+      peer->Invalidate();
+      auto resumed = cache.Acquire(continuation, {}, {}, true, 0, true);
+      assert(resumed->cached_tokens() == frontier.size());
+      auto& restored = dynamic_cast<State&>(resumed->state());
+      assert(runner->adapter->RecurrentHash(restored.slot) == expected);
+      resumed->Invalidate();
+    }
+    if (disk_on) {
+      ComponentTextCache cache(runner, 1, 1 << 22, disk);
+      auto resumed = cache.Acquire(continuation, {}, {}, true, 0, true);
+      assert(resumed->restored_from_disk());
+      assert(resumed->cached_tokens() == frontier.size());
+      auto& restored = dynamic_cast<State&>(resumed->state());
+      assert(runner->adapter->RecurrentHash(restored.slot) == expected);
+      resumed->Invalidate();
+    }
+  }
+}
 void FullChatCheckpointRestoresWithoutSuffixPrefill() {
   const TemporaryDirectory temp("gufo-component-full-test");
   const TextRunnerDiskCacheOptions disk{.directory = temp.path().string(),
@@ -1358,16 +1873,15 @@ void GeneratedFrontierForksBeforeMutation() {
   right.push_back(6);
   auto first = pool.Acquire(left);
   auto second = pool.Acquire(right);
-  // The live frontier serves one fork. No checkpoint covers the generated
-  // token, so the peer restores the prompt and prefills that token again.
+  // One fork continues live; its peer restores the exact generated frontier.
   Expect(first.cached_prompt_tokens() == root.size() &&
              first.cache_restore_bytes() == 0,
          "the first fork continues the live generated frontier");
-  Expect(second.cached_prompt_tokens() == root.size() - 1 &&
+  Expect(second.cached_prompt_tokens() == root.size() &&
              second.cache_restore_bytes() > 0,
-         "the peer restores the retained prompt");
+         "the peer restores the retained generated frontier");
   Expect(first.Prefill(64).consumed_tokens == 1 &&
-             second.Prefill(64).consumed_tokens == 2,
+             second.Prefill(64).consumed_tokens == 1,
          "each fork prefills only what its frontier lacks");
   first.Invalidate();
   second.Invalidate();
@@ -1747,18 +2261,21 @@ void DiskBudgetEvictsAnUnpinnedConversation() {
   const std::vector<TextRunnerToken> first{10, 11, 12, 13, 14, 15, 16, 17, 18};
   auto second = first;
   second.front() = 999;
+  auto second_frontier = second;
   for (const auto& prompt : {first, second}) {
     auto runner = std::make_shared<Runner>();
     TextRunnerPool pool(runner, 1, disk);
     auto request = pool.Acquire(prompt);
     Prefill(request);
-    (void)Generate(request);
+    const auto generated = Generate(request);
+    if (prompt == second)
+      second_frontier.push_back(generated);
     assert(request.Commit().disk_queued_bytes > 0);
   }
   {
     auto runner = std::make_shared<Runner>();
     TextRunnerPool pool(runner, 1, disk);
-    auto retained = pool.Acquire(second);
+    auto retained = pool.Acquire(second_frontier);
     assert(retained.cache_disk_hit());
     retained.Invalidate();
     auto evicted = pool.Acquire(first);
@@ -1875,7 +2392,7 @@ void LoweredDiskBudgetEvictsOldestAtStartup() {
   }
   // Restarting below the retained bytes keeps the budget's meaning: the
   // oldest conversation leaves at startup instead of failing to start.
-  disk.capacity_bytes = ManagedBytes(directory) - 1;
+  disk.capacity_bytes = ManagedBytes(directory) / 2;
   {
     auto runner = std::make_shared<Runner>();
     TextRunnerPool pool(runner, 1, disk);
@@ -2049,6 +2566,202 @@ void PinnedSlotBytesCountOnce() {
     assert(runner->committed == 2 << 20);
   }
   std::filesystem::remove_all(directory);
+}
+// Recovered manifest vectors are already owned before the host recheck and
+// belong inside the total RAM budget. Only their initialized bytes reduce
+// its remaining obligation; ledger reservations and converted estimates do
+// not establish physical storage. Exercise the actual disk and serving paths.
+void RecoveredManifestStorageCountsOnce() {
+  constexpr std::size_t kBudget = 4 << 20, kPin = 4096, kExtra = 256 << 10;
+  constexpr auto kStaging = cache::kDefaultDiskStagingBytes;
+  struct GrantRunner final : Runner {
+    struct Pin {
+      cache::ResourceCharge charge;
+      std::vector<std::byte> bytes;
+    };
+    struct Owner {
+      std::shared_ptr<void> backing;
+      cache::ResourceLedger* ledger;
+      cache::ResourceReservation pending;
+      cache::ResourceCharge estimate;
+      std::vector<Pin> pins;
+      bool building{true};
+    };
+    enum class Extra { kNone, kPending, kEstimate };
+    std::size_t ceiling{}, automatic{};
+    bool pin{}, fail_commit{};
+    Extra extra{Extra::kNone};
+    mutable std::size_t committed{}, limit{}, observations{};
+    mutable cache::ResourceSnapshot at_recheck;
+    mutable std::weak_ptr<Owner> owner;
+    TextRunnerResourceClaim ResourceClaim() const override {
+      const auto held = owner.lock();
+      assert(held);
+      at_recheck = held->ledger->Snapshot();
+      ++observations;
+      auto claim = Runner::ResourceClaim();
+      claim.retained_snapshot_capacity_bytes = automatic;
+      claim.retained_snapshot_ceiling_bytes = ceiling;
+      return claim;
+    }
+    std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
+        cache::ResourceLedger& ledger, std::size_t ram) const override {
+      auto resources = Runner::CreateComponentCacheResources(ledger, ram);
+      auto held = std::make_shared<Owner>();
+      held->backing = std::move(resources->owner);
+      held->ledger = &ledger;
+      if (extra != Extra::kNone) {
+        auto reservation =
+            ledger.Reserve(cache::ResourceCategory::kMetadata, kExtra);
+        if (extra == Extra::kPending)
+          held->pending = std::move(reservation);
+        else
+          held->estimate = reservation.Convert();
+      }
+      owner = held;
+      resources->owner = held;
+      resources->stream = [held, pin = pin,
+                           stream = std::move(resources->stream)] {
+        if (pin && held->building) {
+          auto reserved =
+              held->ledger->Reserve(cache::ResourceCategory::kMetadata, kPin);
+          std::vector<std::byte> bytes(kPin);
+          held->pins.push_back({reserved.Convert(), std::move(bytes)});
+        }
+        return stream();
+      };
+      resources->pinned_bytes = [held] { return held->pins.size() * kPin; };
+      resources->commit_backing = [this, held](std::size_t budget) {
+        held->building = false;
+        committed = budget;
+        limit = held->ledger->Limits().ram_bytes;
+        if (fail_commit)
+          throw std::bad_alloc();
+      };
+      return resources;
+    }
+  };
+  const TemporaryDirectory temp("gufo-component-recovered-grant-test");
+  const TextRunnerDiskCacheOptions disk{.directory = temp.path(),
+                                        .capacity_bytes = 1 << 20,
+                                        .min_checkpoint_step_tokens = 1};
+  std::vector<TextRunnerToken> prompt(40);
+  std::iota(prompt.begin(), prompt.end(), 100);
+  std::uint64_t expected{};
+  std::size_t recovered{};
+  const auto stored = [&] {
+    cache::ResourceLedger ledger({8 << 20, 8 << 20, 0, 8 << 20});
+    cache::DiskStore store(ledger, temp.path(), disk.capacity_bytes);
+    // Recovery has read manifests and dependency metadata, not payload bytes.
+    assert(store.Stats().manifest_bytes_read || store.Entries().empty());
+    return store.OwnedManifestBytes();
+  };
+  const auto run = [&](bool pin, std::size_t shortfall,
+                       GrantRunner::Extra extra = GrantRunner::Extra::kNone,
+                       bool automatic = false) {
+    auto runner = std::make_shared<GrantRunner>();
+    runner->pin = pin;
+    runner->extra = extra;
+    const std::size_t pins = pin ? 2 * kPin : 0;
+    // The post-slot observation already excludes the manifest bytes and pins.
+    // Future staging remains a separate obligation. The cache budget itself
+    // includes recovered metadata; pinned execution slots are outside it.
+    runner->ceiling = kBudget + kStaging - recovered - shortfall;
+    runner->automatic = kBudget - recovered / 2 - pins / 2;
+    const auto previous_level = Logger::Level();
+    Logger::SetLevel(LogLevel::kInfo);
+    std::ostringstream output;
+    auto* previous_sink = std::clog.rdbuf(output.rdbuf());
+    {
+      ComponentTextCache cache(runner, 2, automatic ? 2 * kBudget : kBudget,
+                               disk, automatic, 2 * kBudget);
+      const auto granted = kBudget - shortfall;
+      assert(cache.ram_budget() == granted && runner->committed == granted);
+      assert(runner->limit == granted + pins && runner->observations == 1);
+      assert(runner->at_recheck.ram_bytes > recovered + pins);
+      const auto metadata =
+          static_cast<std::size_t>(cache::ResourceCategory::kMetadata);
+      assert(runner->at_recheck.reserved_bytes[metadata] ==
+             (extra == GrantRunner::Extra::kPending ? kExtra : 0));
+      auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+      assert(lease->restored_from_disk() == (recovered != 0));
+      if (recovered) {
+        assert(lease->cached_tokens() == prompt.size());
+        assert(runner->adapter->RecurrentHash(
+                   dynamic_cast<State&>(lease->state()).slot) == expected);
+      }
+      // Catalog/index and staging allocations still happen under the final
+      // limits; they were not included in the pre-grant storage credit.
+      assert(lease->Metrics().ledger.ram_bytes > runner->at_recheck.ram_bytes);
+      lease->Invalidate();
+    }
+    std::clog.rdbuf(previous_sink);
+    Logger::SetLevel(previous_level);
+    assert(runner->owner.expired());
+    assert(output.str().find(" capacity_bytes=" +
+                             std::to_string(kBudget - shortfall)) !=
+           std::string::npos);
+    assert(output.str().find(" staging_capacity_bytes=" +
+                             std::to_string(kStaging)) != std::string::npos);
+    assert(output.str().find(" slot_pinned_bytes=" + std::to_string(pins)) !=
+           std::string::npos);
+    assert(output.str().find(" owned_manifest_bytes=" +
+                             std::to_string(recovered)) != std::string::npos);
+    assert(output.str().find(" additional_bytes=" +
+                             std::to_string(kBudget - shortfall - recovered +
+                                            kStaging)) != std::string::npos);
+    assert(output.str().find(" automatic_bytes=" + std::to_string(kBudget)) !=
+           std::string::npos);
+  };
+  for (const bool populated : {false, true}) {
+    if (populated) {
+      auto runner = std::make_shared<Runner>();
+      ComponentTextCache cache(runner, 1, kBudget, disk);
+      auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+      auto& state = dynamic_cast<State&>(lease->state());
+      runner->adapter->Append(state.slot, prompt, prompt);
+      expected = runner->adapter->RecurrentHash(state.slot);
+      assert(lease->TryReserveSnapshot(lease->CaptureBytes(), prompt.size(),
+                                       false, SnapshotPurpose::kContinuation,
+                                       {}));
+      assert(lease->PublishSnapshot(prompt, lease->Capture(), false));
+      assert(lease->Metrics().disk_queued_bytes);
+      (void)lease->Commit({}, {}, prompt);
+    }  // Publication drains before reopening the populated directory.
+    recovered = stored();
+    assert((recovered != 0) == populated);
+    for (const bool pin : {false, true}) {
+      run(pin, 0);  // Exact fit of remaining allocations, including staging.
+      run(pin, 1);  // One missing byte still trims the grant by one byte.
+    }
+  }
+  for (const auto extra :
+       {GrantRunner::Extra::kPending, GrantRunner::Extra::kEstimate})
+    run(true, 1, extra);
+  run(true, 0, GrantRunner::Extra::kNone, true);
+  for (const bool allocation_failure : {false, true}) {
+    auto runner = std::make_shared<GrantRunner>();
+    runner->ceiling = allocation_failure ? kBudget + kStaging - recovered : 0;
+    runner->fail_commit = allocation_failure;
+    bool refused = false;
+    try {
+      ComponentTextCache cache(runner, 2, kBudget, disk, false, 2 * kBudget);
+    } catch (const std::bad_alloc&) {
+      assert(allocation_failure);
+      refused = true;
+    } catch (const std::runtime_error& error) {
+      assert(!allocation_failure &&
+             std::string_view(error.what()).find("host reserve") !=
+                 std::string_view::npos);
+      refused = true;
+    }
+    assert(refused && runner->owner.expired());
+    assert((runner->committed != 0) == allocation_failure);
+    // Both insufficient headroom and injected backing failure release all
+    // directory ownership, and neither discards the valid persisted entry.
+    assert(stored() == recovered);
+  }
+  run(false, 0);
 }
 // Without pins the limit ends at the requested budget, whether or not the
 // runner commits backing, and a budget below what is already charged still
@@ -2678,6 +3391,295 @@ void RamCacheOffCommitsNoBackingAndKeepsLiveFrontiers() {
     assert((runner->captures != 0) == enabled);
   }
 }
+// The model sampled "sk" "ý" and "Lie" "v"; the next prompt replays that
+// answer as text and tokenizes it as "ský" and "L" "iev" (#1154). Only the
+// live frontier holds the work, as with the RAM cache off.
+void RetokenizedAnswerContinuesTheLiveFrontier() {
+  // 50 stands for <|im_end|>; the template trims whitespace before it.
+  static const std::map<TextRunnerToken, std::string> pieces{
+      {20, "sk"},  {21, "\xC3\xBD"},  {22, "sk\xC3\xBD"}, {30, "L"},
+      {31, "iev"}, {32, "Lie"},       {33, "v"},          {34, "iex"},
+      {40, "."},   {41, ".\n\n"},     {42, "\n\n"},       {43, "\xE3\x80\x80"},
+      {44, " "},   {50, "<|im_end|>"}};
+  class TextRunner final : public Runner {
+  public:
+    std::vector<TextRunnerToken> Tokenize(
+        std::string_view text) const override {
+      for (const auto& [token, piece] : pieces)
+        if (piece == text)
+          return {token};
+      return {};
+    }
+    std::string Decode(std::span<const TextRunnerToken> tokens) const override {
+      std::string text;
+      for (const auto token : tokens) {
+        const auto found = pieces.find(token);
+        text += found != pieces.end() ? found->second
+                                      : "<" + std::to_string(token) + ">";
+      }
+      return text;
+    }
+  };
+  auto runner = std::make_shared<TextRunner>();
+  using Tokens = std::vector<TextRunnerToken>;
+  // Commits `frontier`, whose reply the model generated from `reply` on.
+  const auto commit = [&](ComponentTextCache& cache, const Tokens& frontier,
+                          std::size_t reply) {
+    const Tokens prompt(frontier.begin(), frontier.begin() + reply);
+    auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+    auto& state = dynamic_cast<State&>(lease->state());
+    lease->PreparePrefill(prompt.size());
+    runner->adapter->Append(state.slot, frontier, frontier);
+    (void)lease->Commit({}, {}, frontier);
+  };
+  {
+    ComponentTextCache cache(runner, 1, 1 << 22, {});
+    const Tokens frontier{1, 2, 20, 21, 50};
+    commit(cache, frontier, 2);
+    auto peer = cache.Acquire(Tokens{90, 91}, {}, {}, true, 0, true);
+    peer->Invalidate();
+    Tokens prompt{1, 2, 22, 50, 6};
+    std::size_t stable = 0;
+    assert(cache.AlignToLiveFrontier(prompt, stable, 4096, false));
+    assert((prompt == Tokens{1, 2, 20, 21, 50, 6}));
+    auto resumed = cache.Acquire(prompt, {}, {}, true, 0, true);
+    assert(resumed->cached_tokens() == frontier.size());
+    resumed->Invalidate();
+    Tokens edited{1, 2, 22, 34, 50, 6};
+    assert(!cache.AlignToLiveFrontier(edited, stable, 4096, false));
+  }
+  {
+    // An unchanged retry after the interrupted turn's continuation: the
+    // prompt's own tokens begin the newer frontier. Rewriting it to the
+    // interrupted frontier's tokens would change the identical request's
+    // sampled output.
+    ComponentTextCache cache(runner, 2, 0, {}, false, 0, false);
+    commit(cache, Tokens{1, 2, 20, 21, 50}, 2);
+    commit(cache, Tokens{1, 2, 22, 50, 6, 7}, 5);
+    Tokens retry{1, 2, 22, 50, 6};
+    std::size_t stable = 0;
+    assert(!cache.AlignToLiveFrontier(retry, stable, 4096, false));
+    assert((retry == Tokens{1, 2, 22, 50, 6}) && stable == 0);
+  }
+  {
+    // An unchanged retry of an aligned prompt: the live frontier now ends
+    // after the retried reply, and a checkpoint retains the aligned prompt.
+    // A fresh tokenization would diverge from it and change sampled output.
+    ComponentTextCache cache(runner, 1, 1 << 22, {});
+    const Tokens aligned{1, 2, 20, 21, 50, 6};
+    auto lease = cache.Acquire(aligned, {}, {}, true, 5, true);
+    auto& state = dynamic_cast<State&>(lease->state());
+    lease->PreparePrefill(aligned.size());
+    runner->adapter->Append(state.slot, aligned, aligned);
+    assert(lease->TryReserveSnapshot(lease->CaptureBytes(), aligned.size(),
+                                     false, SnapshotPurpose::kRetry, aligned));
+    assert(lease->PublishSnapshot(aligned, lease->Capture(), false));
+    const Tokens reply{7};
+    runner->adapter->Append(state.slot, reply, reply);
+    Tokens frontier = aligned;
+    frontier.push_back(7);
+    (void)lease->Commit({}, {}, frontier);
+    // The stable boundary before the user turn moves with the rewrite.
+    Tokens retry{1, 2, 22, 50, 6};
+    std::size_t stable = 4;
+    assert(cache.AlignToLiveFrontier(retry, stable, 4096, true));
+    assert(retry == aligned && stable == 5);
+    auto again = cache.Acquire(retry, {}, {}, true, stable, true);
+    assert(again->cache_hit());
+    again->Invalidate();
+    // "ský" ends at the same text as the frontier's "sk" "ý".
+    retry = {1, 2, 22, 50, 6};
+    stable = 3;
+    assert(cache.AlignToLiveFrontier(retry, stable, 4096, true));
+    assert(retry == aligned && stable == 4);
+    // Without that checkpoint a prompt ending inside the frontier stays.
+    Tokens shorter{1, 2, 22, 50};
+    stable = 0;
+    assert(!cache.AlignToLiveFrontier(shorter, stable, 4096, true));
+    assert((shorter == Tokens{1, 2, 22, 50}));
+  }
+  {
+    // The aligned prompt restored whitespace the template trimmed from a
+    // reply's end. Its unchanged retry trims it again and must align too.
+    ComponentTextCache cache(runner, 1, 1 << 22, {});
+    commit(cache, {1, 40, 42, 50}, 1);
+    Tokens prompt{1, 40, 50, 6};
+    std::size_t stable = 0;
+    assert(cache.AlignToLiveFrontier(prompt, stable, 4096, true));
+    const Tokens aligned{1, 40, 42, 50, 6};
+    assert(prompt == aligned);
+    auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+    auto& state = dynamic_cast<State&>(lease->state());
+    lease->PreparePrefill(prompt.size());
+    const Tokens user{6};
+    runner->adapter->Append(state.slot, user, user);
+    assert(lease->TryReserveSnapshot(lease->CaptureBytes(), aligned.size(),
+                                     false, SnapshotPurpose::kRetry, aligned));
+    assert(lease->PublishSnapshot(aligned, lease->Capture(), false));
+    const Tokens reply{7};
+    runner->adapter->Append(state.slot, reply, reply);
+    (void)lease->Commit({}, {}, Tokens{1, 40, 42, 50, 6, 7});
+    // The stable boundary after the trimmed edge maps across it.
+    Tokens retry{1, 40, 50, 6};
+    stable = 3;
+    assert(cache.AlignToLiveFrontier(retry, stable, 4096, true));
+    assert(retry == aligned && stable == 4);
+    auto again = cache.Acquire(retry, {}, {}, true, 0, true);
+    assert(again->cache_hit() && again->cached_tokens() == aligned.size());
+    again->Invalidate();
+  }
+  // The prompt the cache gives `prompt` after `frontier`, or nothing.
+  const auto align = [&](const Tokens& frontier, Tokens prompt,
+                         std::size_t reply = 1,
+                         bool trimmed = true) -> std::optional<Tokens> {
+    ComponentTextCache cache(runner, 1, 0, {}, false, 0, false);
+    commit(cache, frontier, reply);
+    const auto original = prompt;
+    std::size_t stable = 0;
+    if (!cache.AlignToLiveFrontier(prompt, stable, 4096, trimmed)) {
+      assert(prompt == original && stable == 0);
+      return std::nullopt;
+    }
+    auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+    assert(lease->cache_hit() && lease->cached_tokens() == frontier.size());
+    lease->Invalidate();
+    return prompt;
+  };
+
+  // finish=length on whitespace: the prompt trims it before <|im_end|>.
+  assert((align({1, 40, 42}, {1, 40, 50, 6}) == Tokens{1, 40, 42, 50, 6}));
+  assert(
+      (align({1, 40, 44, 43}, {1, 40, 50, 6}) == Tokens{1, 40, 44, 43, 50, 6}));
+  // finish=stop after whitespace, and whitespace merged into punctuation.
+  assert((align({1, 40, 42, 50}, {1, 40, 50, 6}) == Tokens{1, 40, 42, 50, 6}));
+  assert((align({1, 41}, {1, 40, 50, 6}) == Tokens{1, 41, 50, 6}));
+  assert((align({1, 41, 50}, {1, 40, 50, 6}) == Tokens{1, 41, 50, 6}));
+  // Leading whitespace of a reply.
+  assert((align({1, 42, 32, 33, 50}, {1, 32, 33, 50, 6}) ==
+          Tokens{1, 42, 32, 33, 50, 6}));
+  // Cut off inside "ský": the rest of that token follows the frontier.
+  assert((align({1, 2, 20}, {1, 2, 22, 50, 6}) == Tokens{1, 2, 20, 21, 50, 6}));
+  // Whitespace is not dropped before text that differs, nor kept where the
+  // prompt continues the frontier differently.
+  assert(!align({1, 42, 5}, {1, 6}));
+  assert(!align({1, 40, 42, 5}, {1, 40, 50, 6}));
+  // Text is never dropped, only whitespace.
+  assert(!align({1, 40, 33}, {1, 40, 50, 6}));
+  // A fragment that does not tokenize back to itself ("ie" of "Lie").
+  assert(!align({1, 30}, {1, 32, 50}));
+  // Whitespace a client removed inside a reply, or from a prompt the model
+  // did not answer, is an edit, as is any whitespace without a template.
+  assert(!align({1, 40, 42, 32, 33, 50}, {1, 40, 32, 33, 50, 6}));
+  assert(!align({1, 40, 42, 32, 33, 50}, {1, 40, 32, 33, 50, 6}, 4));
+  assert(!align({1, 40, 42}, {1, 40, 50, 6}, 1, false));
+  assert(!align({1, 42, 32, 33, 50}, {1, 32, 33, 50, 6}, 1, false));
+  assert((align({1, 2, 20, 21, 50}, {1, 2, 22, 50, 6}, 1, false) ==
+          Tokens{1, 2, 20, 21, 50, 6}));
+  {
+    // A later turn: the frontier keeps the whitespace an earlier one
+    // restored, so the edges of that reply move with it.
+    ComponentTextCache cache(runner, 1, 0, {}, false, 0, false);
+    commit(cache, {1, 40, 42, 50}, 1);
+    Tokens prompt{1, 40, 50, 6};
+    std::size_t stable = 0;
+    assert(cache.AlignToLiveFrontier(prompt, stable, 4096, true));
+    assert((prompt == Tokens{1, 40, 42, 50, 6}));
+    auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
+    assert(lease->cache_hit() && lease->cached_tokens() == 4);
+    auto& state = dynamic_cast<State&>(lease->state());
+    lease->PreparePrefill(prompt.size());
+    const Tokens tail{6, 7};
+    runner->adapter->Append(state.slot, tail, tail);
+    (void)lease->Commit({}, {}, Tokens{1, 40, 42, 50, 6, 7});
+    Tokens next{1, 40, 50, 6, 7, 8};
+    assert(cache.AlignToLiveFrontier(next, stable, 4096, true));
+    assert((next == Tokens{1, 40, 42, 50, 6, 7, 8}));
+  }
+
+  ComponentTextCache cache(runner, 1, 0, {}, false, 0, false);
+  const Tokens sampled{1, 2, 3, 20, 21, 4, 32, 33, 5};
+  commit(cache, sampled, 3);
+  const auto unchanged = [&](Tokens prompt, std::size_t stable = 0,
+                             std::size_t limit = 4096) {
+    const auto original = prompt;
+    const auto original_stable = stable;
+    const bool aligned = cache.AlignToLiveFrontier(prompt, stable, limit, true);
+    return !aligned && prompt == original && stable == original_stable;
+  };
+  // Already the frontier's own tokens.
+  assert(unchanged({1, 2, 3, 20, 21, 4, 32, 33, 5, 6}));
+  // Different text inside the answer.
+  assert(unchanged({1, 2, 3, 22, 4, 30, 34, 5, 6}));
+  // The prompt edits the frontier's last token.
+  assert(unchanged({1, 2, 3, 22, 4, 30, 31, 9, 6}));
+  // The prompt ends before the frontier's text does.
+  assert(unchanged({1, 2, 3, 22, 4, 32}));
+  // The stable boundary lies inside the replaced tokens.
+  assert(unchanged({1, 2, 3, 22, 4, 30, 31, 5, 6, 7}, 4));
+  // The aligned prompt would reach the context limit.
+  assert(unchanged({1, 2, 3, 22, 4, 30, 31, 5, 6, 7}, 0, 11));
+
+  Tokens prompt{1, 2, 3, 22, 4, 30, 31, 5, 6, 7};
+  std::size_t stable = 8;
+  assert(cache.AlignToLiveFrontier(prompt, stable, 4096, true));
+  assert((prompt == Tokens{1, 2, 3, 20, 21, 4, 32, 33, 5, 6, 7}));
+  assert(stable == 9);
+  auto lease = cache.Acquire(prompt, {}, {}, true, stable, true);
+  assert(lease->cache_hit() && lease->cached_tokens() == sampled.size());
+  // A busy frontier is not offered.
+  Tokens busy{1, 2, 3, 22, 4, 30, 31, 5, 6, 7};
+  std::size_t busy_stable = 0;
+  assert(!cache.AlignToLiveFrontier(busy, busy_stable, 4096, true));
+  lease->Invalidate();
+}
+// Disk metadata admission is independent of the RAM and disk budgets.
+// Account for a fully committed disk-capture pool without allocating its bytes.
+void RamCacheOffAllowsLargeDiskIndexMetadata() {
+  class AccountingRunner final : public Runner {
+  public:
+    mutable cache::ResourceLedger* ledger{};
+    mutable cache::ResourceCharge backing;
+    std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
+        cache::ResourceLedger& resources, std::size_t ram) const override {
+      ledger = &resources;
+      auto result = Runner::CreateComponentCacheResources(resources, ram);
+      result->commit_backing = [this](std::size_t bytes) {
+        backing = ledger->Reserve(cache::ResourceCategory::kBackingFree, bytes)
+                      .Convert();
+      };
+      return result;
+    }
+  };
+  for (const std::size_t ram : {std::size_t{1}, std::size_t{2} << 30}) {
+    const TemporaryDirectory temp("gufo-component-off-disk-metadata-test");
+    const TextRunnerDiskCacheOptions disk{.directory = temp.path().string(),
+                                          .capacity_bytes = 1 << 20};
+    auto runner = std::make_shared<AccountingRunner>();
+    ComponentTextCache cache(runner, 1, ram, disk, false, 0, false);
+    assert(runner->backing.Info().bytes == 512ULL << 20);
+    assert(runner->ledger->Limits().staging_bytes ==
+           cache::kDefaultDiskStagingBytes);
+    const auto before = runner->ledger->Snapshot().ram_bytes;
+    auto metadata = runner->ledger->Reserve(cache::ResourceCategory::kMetadata,
+                                            128ULL << 20);
+    assert(runner->ledger->Snapshot().ram_bytes == before + (128ULL << 20));
+    auto payload =
+        runner->backing.ReserveBacking(cache::ResourceCategory::kPrivateState)
+            .Convert();
+    auto pin = payload.PinPersistence();
+    assert(runner->ledger->Snapshot().persistence_pinned_bytes == 512ULL << 20);
+    auto extra =
+        runner->ledger->Reserve(cache::ResourceCategory::kPrivateState, 1)
+            .Convert();
+    bool rejected = false;
+    try {
+      auto excess_pin = extra.PinPersistence();
+    } catch (const std::bad_alloc&) {
+      rejected = true;
+    }
+    assert(rejected);
+  }
+}
 // With a disk cache the off RAM cache keeps no checkpoint in RAM and commits
 // only the backing disk captures copy through.
 void RamCacheOffWithDiskCommitsOnlyStagingBacking() {
@@ -2720,7 +3722,7 @@ void RamCacheOffWithDiskCommitsOnlyStagingBacking() {
     (void)lease->Commit(prompt, {}, prompt);
   }
   auto runner = std::make_shared<CountingRunner>();
-  ComponentTextCache cache(runner, 1, 1 << 24, disk, false, 0, false);
+  ComponentTextCache cache(runner, 1, 1, disk, false, 0, false);
   auto lease = cache.Acquire(prompt, {}, {}, true, 0, true);
   assert(lease->restored_from_disk() &&
          lease->cached_tokens() == prompt.size());
@@ -3075,10 +4077,20 @@ void IndivisibleInputsAreNotSplit() {
   }
 }
 int main() {
+  TransferProviderCompatibility();
+  ConcurrentBoundedTransfers();
+  BoundedTransferDiskProgress();
+  RamCacheOffAllowsLargeDiskIndexMetadata();
   IndivisibleInputsAreNotSplit();
   PromptReuseCanBeDisabledPerRequest();
   StableChatPrefixSurvivesInterruptedFraming();
   WarmTurnsAdvanceTheStableCheckpoint();
+  GeneratedFrontierKeepsTheCurrentRetryUnderPressure();
+  OptionalFrontiersLeaveTheNextPromptACompleteCapture();
+  PromptCaptureReclaimsUnusedGeneratedStateFirst();
+  IdleFrontierSetupRefusalKeepsTheCompletedLiveExecution();
+  IdleFrontierCaptureReturnsBeforeCopyAndAdmissionWaits();
+  GeneratedFrontierSurvivesReassignmentAndRestart();
   FullChatCheckpointRestoresWithoutSuffixPrefill();
   GeneratedFrontierForksBeforeMutation();
   InterruptedPrefillRetainsOnlyItsEntryFrontier();
@@ -3125,6 +4137,7 @@ int main() {
   StagingIsInternal();
   StagingCountsAgainstRamCeiling();
   PinnedSlotBytesCountOnce();
+  RecoveredManifestStorageCountsOnce();
   UnpinnedRunnersKeepTheirLimit();
   DiskDirectoryHasOneOwner();
   GridDoesNotSuppressFirstDiskPrompt();
@@ -3138,6 +4151,7 @@ int main() {
   OverRamCaptureStagesPrivateStateUnderPressure(false);
   OverRamCaptureStagesPrivateStateUnderPressure(true);
   RamCacheOffCommitsNoBackingAndKeepsLiveFrontiers();
+  RetokenizedAnswerContinuesTheLiveFrontier();
   RamCacheOffWithDiskCommitsOnlyStagingBacking();
   HostBelowReserveRefusesUnlessRamCacheOff();
   TrimmedRamBudgetIsReported();

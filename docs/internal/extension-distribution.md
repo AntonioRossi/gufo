@@ -56,6 +56,9 @@ and a Nix build sandbox does not sandbox the server that later runs the model.
   or a SHA-256 digest of a copied directory.
 - `diagnose --section extensions` reports a module's source as
   `module:<path>`.
+- An extension compiled in from `GUFO_EXTENSION_DIRS` reports the `revision` it
+  was built from and whether its tree was `dirty`; see
+  [provenance](extension-build.md#provenance).
 
 For any published artifact, retain the Gufo and extension revisions, toolchain,
 build options, `extensions.lock`, model artifact identities, install inventory,
@@ -66,6 +69,33 @@ binary's own output, not another `gufo` from `PATH`:
 /path/to/installed/gufo --version
 /path/to/installed/gufo diagnose --section extensions --json
 ```
+
+## Running third-party extensions
+
+An unreviewed extension gets everything the server process gets. Whatever
+service manager or container runtime you use, give that process only what
+inference needs:
+
+- **Network:** none. Gufo binds `127.0.0.1` by default and serves from a network
+  namespace that has only `lo`; forward one socket into it for clients.
+- **Devices:** `/dev/kfd` and the DRM nodes under `/dev/dri`, with the `video`
+  and `render` groups. Both are needed: without the DRM nodes the kernel logs
+  `amdgpu: no gpu node! Cannot create KFD process` and Gufo reports no ROCm
+  device.
+- **Files:** read-only models, binary and extension store. Only `/tmp` and a
+  [`--cache-disk`](../cache.md#disk) directory need to be writable.
+- **Privileges:** no capabilities and no new privileges; an unlimited
+  `memlock` limit, as in [install](../install.md#container).
+
+Install or build the extension in a separate step, with network access but no
+devices or models, and pin an exact commit. Gufo has no authentication, so
+remote clients need a reverse proxy with TLS and access control; see
+[exposure](../server.md#exposure).
+
+> **Warning:** This limits what an extension can reach; it isn't a sandbox. The
+> process still drives the GPU, reads every mounted model and sees every
+> request, and the extension's build scripts run when it is installed or
+> compiled in.
 
 ## Modules
 
@@ -134,7 +164,10 @@ asset paths, and test the installed layout without access to the build tree.
 ## Nix recipe
 
 The [template](../../examples/extension_template/README.md) flake pins Gufo and
-builds `gufo.packages.x86_64-linux.default.override { extensions = [ self.outPath ]; }`.
+builds `gufo.packages.x86_64-linux.default.override { extensions = [ self ]; }`.
+Pass the flake or flake input itself, not its `outPath`: the package records its
+`rev`, `dirtyRev` or `narHash` as the extension's revision, and a bare path
+reports `unknown`.
 Extra Nix dependencies come from the author's package (`overrideAttrs`,
 `buildInputs`); manifest package names are an inventory, not an installer. Use
 the `release` package for lock-mode builds. `gufo.lib.<system>.withExtensionModules`
@@ -179,6 +212,8 @@ python3 tools/extensions/check_install.py \
   --report artifacts/my-extension-install.json
 ```
 
+`--require-clean-revision` fails when an external extension reports `unknown`
+or a dirty tree; in-tree extensions report no revision and always pass.
 `--runtime-manifest PATH` also requires every file a line-oriented runtime
 manifest names. Pair it with dynamic-dependency inspection and real capability
 runs; packaging alone qualifies nothing.

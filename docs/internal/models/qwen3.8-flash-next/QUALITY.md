@@ -1,5 +1,115 @@
 # Qwen3.8 Flash-Next quality
 
+## Q4_K draft head, November 13, 2026
+
+Main `6858788b` against the candidate on the same host and toolchain; the
+draft head's prefix rows become a Q4_K copy of the Q8_0 head. Drafts only
+propose: greedy verification takes the target's argmax and sampled
+verification keeps exact rejection sampling with the proposal's own
+distribution, so the output distribution is unchanged.
+
+- `qwen38_flash_next.mtp_ops`: the device quantizer reproduces a host
+  implementation of ggml's `quantize_row_q4_K_ref` byte for byte on 96 rows
+  with constant, positive-only, negative-only, zero and zero-scale
+  sub-blocks; reconstruction error stays below 10% RMS; eight rows projected
+  together equal eight single-row projections bit for bit. The quantizer
+  builds without fast math: with it, the `__f*_rn` helpers and native square
+  root changed results in the last bits.
+- On the real head the copy reconstructs the Q8_0 rows with 7.465% relative
+  RMS error, against 7.467% for ggml's CPU quantizer (each better in about
+  half of the superblocks over 3,000 rows); the bytes differ in rounding only.
+- Session test (`--batch-only`, `--sampling-only`, `--lookup-only`): C2–C8
+  AR/MTP logits and RNG exact, mixed small/full-head batches exact, sampled
+  schedules and restores exact.
+- HTTP, four sessions at context 65,536: five greedy thinking-off replies of
+  384 tokens are byte-identical to main; four seeded default-sampling
+  requests give the same text alone and concurrently on both builds (their
+  text differs between builds, as any proposal change shifts the draws).
+- Default sampling, C1, six tasks (three thinking, three thinking-off) of
+  596–1,024 tokens, two repetitions per arm in alternating server order:
+  46.44 → 47.64 tok/s (+2.6%), acceptance 0.628 → 0.633. Greedy C1 replies:
+  +3.2% to +5.7% on four prompts, unchanged on the fifth. C4 greedy is
+  neutral (unplanned greedy batches keep the full head), C4 sampled +3.5%.
+  Load time is unchanged (15.5–16.4 s against 15.5–15.6 s).
+
+## CPU serving paths, November 9, 2026
+
+The issue #716 adaptation preserves the host arithmetic and keeps portable
+fallbacks. Focused `sampling_test`, `ggml_dequant_test` and
+`qwen38_flash_next.ngram` pass in 0.59 seconds total:
+
+- Block maxima match the scalar definition for lengths 0–129, every winning
+  lane, unaligned inputs, negative values, NaNs, infinities and signed zero.
+- IQ4_NL exhausts all 65,536 half scales and all codebook entries, comparing
+  output bits, including NaN payloads, and checking output guards.
+- BF16 exhausts all 65,536 bit patterns through unaligned cold and cached
+  table reads with a 17-value row, including the scalar tail.
+- Reciprocal remainders match `%` over about 5.75 million cases: random
+  dividends, multiples and their neighbors, powers of two and their
+  neighboring divisors, one and `UINT32_MAX`. Mutating a Config at the same
+  address must immediately use its new divisors; existing independent hash
+  goldens and incremental-history checks also pass.
+
+Nix production builds compare main `6a021263` with the candidate using
+`sampling-defaults` on Flash-Next AR/MTP and Qwen 27B Q4 AR/DFlash2.
+All 384 candidate requests pass functional assertions and match main's output
+and work counts. Loaded speculative modes and actual drafts are verified.
+Flash-Next passes all 2,704 request/phase timing observations at the unchanged
+5% and 10 ms margins. Focused replays through the last affected case, with unchanged-main controls,
+leave Qwen 27B AR at 1,322 passed/30 inconclusive timing measurements and
+DFlash2 at 1,331 passed/21 inconclusive. The same concurrent snapshot and
+inter-token delays occur on unchanged main. There are no confirmed timing
+failures, but these observations remain unqualified; this is not a global
+timing pass. The standard pp2048/tg128 production controls also complete
+in AR/MTP, greedy and sampled modes; [rates and scope](EXPERIMENTS.md#cpu-measurements-november-9-2026)
+remain separate from HTTP timing qualification.
+
+Build identities, every raw request, reports, follow-ups and microbenchmark
+sources are retained in `/home/fbozzo/projects/validation/issue716-20261109/`.
+The shared formatting check and extension API surface check pass; the API
+remains 0.2.23. Windows and CPUs without AVX-512 were not executed here.
+
+## PR #877 controls, November 4, 2026
+
+Pinned main `1c75887b` versus runtime candidate `e6b2a4c1`, Nix production
+builds, ROCm 10.1 on the same Strix Halo. `gufo bench -p 2048 -n 128
+-d 0,4096 -r 2`, same UD-Q4_K_XL and shared Q8_0 MTP sidecar. Values are
+reported tok/s from two repetitions; these are regression controls, not a
+refresh of the published llama.cpp comparisons in [BENCHMARKS.md](BENCHMARKS.md).
+
+| Mode | Depth | Main pp | Candidate pp | Main tg | Candidate tg |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| AR | 0 | 1,932.39 | 1,938.25 | 30.05 | 30.05 |
+| AR | 4,096 | 1,872.58 | 1,874.96 | 29.38 | 29.36 |
+| MTP | 0 | 1,870.13 | 1,870.21 | 62.70 | 62.65 |
+| MTP | 4,096 | 1,787.34 | 1,789.39 | 51.44 | 51.53 |
+
+The canonical HTTP serving tool also ran a fixed 619-token prompt (the
+pangram question repeated 32 times), homogeneous C1/C2/C4/C6/C8 cohorts,
+128 output tokens, greedy, thinking off, context 8,192, eight sessions,
+queue limit 16 and a 4 GiB RAM cache. Prompt reuse was disabled; one warmup
+and two measured rounds ran per concurrency. Each cell below is the median
+of two sums of individual request decode rates, not whole-request aggregate
+throughput. All output hashes and prompt/prefill/completion counts match.
+
+| Concurrency | Main AR | Candidate AR | Main MTP | Candidate MTP |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 30.23 | 30.22 | 53.24 | 53.25 |
+| 2 | 48.21 | 48.17 | 72.96 | 72.97 |
+| 4 | 74.72 | 74.68 | 109.52 | 109.60 |
+| 6 | 93.73 | 93.67 | 125.09 | 125.36 |
+| 8 | 106.78 | 106.79 | 143.64 | 143.82 |
+
+The simultaneous clients enter the scheduler in a different index order.
+Raw per-index latency flags remain retained (56 AR, 51 MTP); matching the
+identical histories by admission rank has no phase outside 5% and 10 ms,
+but is diagnostic, not a strict per-client timing pass. No request was
+rejected and MTP drafts executed at every concurrency. Separate continuation
+controls retain inconclusive disk timings; the rates above do not qualify
+those observations. Peak driver GTT is identical: AR 84,774.46 MiB and
+MTP 88,931.12 MiB. Host RSS peaks are AR 3,117 → 3,085 MiB and
+MTP 3,125 → 3,147 MiB (about 22 MiB variation).
+
 ## Raw-completion follow-up, November 4, 2026
 
 GitHub exposed a case missing from the first qualification: a raw completion

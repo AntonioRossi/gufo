@@ -2,7 +2,7 @@
   "schema": 1,
   "name": "embedding_gemma2",
   "version": "0.1.0",
-  "api_version": ">= 0.2.0",
+  "api_version": ">= 0.3.0",
   "entry": "embedding_gemma2_register",
   "registration_target": "gufo_embedding_gemma2",
   "depends": [],
@@ -25,6 +25,26 @@
       "entry": "embedding_gemma2_provider_register"
     }
   ],
+  "models": [
+    {
+      "id": "embeddinggemma-2",
+      "provider": "embeddinggemma-2",
+      "license": "apache-2.0",
+      "description": "EmbeddingGemma 2, BF16 safetensors",
+      "components": [
+        {
+          "role": "weights",
+          "option": "--model",
+          "install": "required",
+          "entry": ".",
+          "source": {
+            "hf": "google/embeddinggemma-2",
+            "revision": "914f7f89142e33e77833254d9c9b90c3cef7303b"
+          }
+        }
+      ]
+    }
+  ],
   "options": [
     {
       "name": "--default-prompt-name",
@@ -36,6 +56,17 @@
         "embeddinggemma-2"
       ],
       "help": "Checkpoint prompt for text inputs without prompt_name (default: none)"
+    },
+    {
+      "name": "--npu",
+      "type": "boolean",
+      "commands": [
+        "serve embedding"
+      ],
+      "providers": [
+        "embeddinggemma-2"
+      ],
+      "help": "Embed text on the XDNA NPU instead of the GPU"
     }
   ],
   "targets": {
@@ -49,16 +80,6 @@
     }
   },
   "packages": [
-    {
-      "pkg_config": "sndfile",
-      "nix": "libsndfile",
-      "windows": "libsndfile"
-    },
-    {
-      "pkg_config": "soxr",
-      "nix": "soxr",
-      "windows": "soxr"
-    },
     {
       "pkg_config": "libavformat",
       "nix": "ffmpeg-headless",
@@ -89,7 +110,8 @@
       "**/*.h",
       "**/*.hpp",
       "**/*.hip",
-      "extension.*"
+      "extension.*",
+      "models.lock.json"
     ],
     "exclude": [
       "tests/",
