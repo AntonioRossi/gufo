@@ -76,6 +76,7 @@ endif()
 set(DS41_VARIANT_SOURCES
   continuation_layout.cpp
   continuation_adapter.cpp
+  continuation_identity.cpp
   engine.cpp
   runtime/expert_store.cpp
   runtime/model_data.cpp

@@ -65,3 +65,14 @@ if(TARGET gufo_deepseek_v41_flash_hip)
   target_link_libraries(ds41_probe_check PRIVATE
     gufo_deepseek_v41_flash gufo_core)
 endif()
+
+add_executable(ds41_continuation_identity_test
+  continuation_identity_test.cpp
+  identity_v384.cpp
+  identity_coder.cpp)
+target_include_directories(ds41_continuation_identity_test PRIVATE
+  ${PROJECT_SOURCE_DIR})
+add_test(NAME ds41.continuation_identity
+  COMMAND ds41_continuation_identity_test)
+set_tests_properties(ds41.continuation_identity PROPERTIES
+  LABELS "cpu;ds41;cache")

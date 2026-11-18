@@ -11,7 +11,9 @@
 #include <utility>
 #include <vector>
 
+#include "src/core/gguf_identity.hpp"
 #include "src/models/deepseek_v41_flash/continuation_adapter.hpp"
+#include "src/models/deepseek_v41_flash/continuation_identity.hpp"
 #include "src/models/deepseek_v41_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v41_flash/engine.hpp"
 #include "src/models/deepseek_v41_flash/options.hpp"
@@ -92,12 +94,22 @@ public:
   std::string ToolDialectId() const override { return "deepseek41"; }
 
   Runner(std::shared_ptr<Model> model, std::size_t session_count,
-         bool use_dspark, std::uint32_t max_draft_tokens)
+         bool use_dspark, std::uint32_t max_draft_tokens,
+         std::string artifact_fingerprint, std::string support_fingerprint)
       : execution_(std::make_shared<Execution>()),
         session_count_(session_count),
         use_dspark_(use_dspark),
         max_draft_tokens_(std::max(max_draft_tokens, 1u)) {
     execution_->model = std::move(model);
+    if (artifact_fingerprint.empty()) {
+      component_identity_ = DeepSeek41ProcessIdentity(
+          execution_->model.get(), execution_->model->MaxContext(), use_dspark_,
+          max_draft_tokens_);
+    } else {
+      component_identity_ = DeepSeek41CompatibilityIdentity(
+          artifact_fingerprint, support_fingerprint,
+          execution_->model->MaxContext(), use_dspark_, max_draft_tokens_);
+    }
     execution_->Allocate(session_count, use_dspark_);
   }
 
@@ -242,19 +254,12 @@ public:
       std::size_t sessions) const override {
     const std::lock_guard lock(execution_->mutex);
     const auto transfers = hip::PlanComponentTransfers(sessions);
-    const auto address =
-        reinterpret_cast<std::uintptr_t>(execution_->model.get());
-    const auto* bytes = reinterpret_cast<const std::uint8_t*>(&address);
-    cache::Identity identity(bytes, bytes + sizeof(address));
-    for (unsigned i = 0; i < 4; ++i)
-      identity.push_back(
-          static_cast<std::uint8_t>(max_draft_tokens_ >> (8 * i)));
     return hip::CreateHipComponentCacheResources(
         std::make_unique<ContinuationAdapter>(
             execution_->model,
             use_dspark_ ? core::SessionMode::kSpeculative
                         : core::SessionMode::kAutoregressive,
-            execution_->model->MaxContext(), std::move(identity),
+            execution_->model->MaxContext(), component_identity_,
             std::move(execution_->idle)),
         ledger,
         {[] { return ext::HostSnapshotCeilingBytes(); },
@@ -579,6 +584,7 @@ private:
   std::size_t session_count_;
   bool use_dspark_;
   std::uint32_t max_draft_tokens_;
+  cache::Identity component_identity_;
 };
 
 }  // namespace
@@ -626,9 +632,6 @@ std::shared_ptr<ext::TextModelRunner> CreateDeepSeekTextRunner(
 #endif
     if (!options.vision_model_path.empty())
       throw std::invalid_argument("DeepSeek V4.1 vision is not supported");
-    if (!options.disk_cache.directory.empty())
-      throw std::invalid_argument(
-          "DeepSeek V4.1 prompt caching is not supported");
     if (options.enable_yarn)
       throw std::invalid_argument(
           "--enable-yarn is not supported by DeepSeek V4.1");
@@ -640,6 +643,24 @@ std::shared_ptr<ext::TextModelRunner> CreateDeepSeekTextRunner(
       throw std::runtime_error("Cannot open DeepSeek V4.1 GGUF: " + detail);
     if (!ValidateGgufTemplate(*reader, &detail))
       throw std::invalid_argument(detail);
+    std::string artifact_fingerprint =
+        options.disk_cache.model_artifact_fingerprint;
+    std::string support_fingerprint =
+        options.disk_cache.draft_model_artifact_fingerprint;
+    if (!options.disk_cache.directory.empty()) {
+      if (artifact_fingerprint.empty())
+        artifact_fingerprint = core::GgufIdentityHex(*reader);
+      if (use_dspark && support_fingerprint.empty()) {
+        std::string draft_error;
+        auto drafter = core::GgufReader::OpenFile(
+            options.speculative.draft_model_path, &draft_error,
+            core::GgufOpenOptions{.allow_unsized_tensors = true});
+        if (!drafter)
+          throw std::runtime_error("Cannot open DeepSeek V4.1 drafter: " +
+                                   draft_error);
+        support_fingerprint = core::GgufIdentityHex(*drafter);
+      }
+    }
     std::uint64_t context = options.max_context;
     if (context == 0)
       context =
@@ -659,7 +680,8 @@ std::shared_ptr<ext::TextModelRunner> CreateDeepSeekTextRunner(
       throw std::runtime_error("Cannot load DeepSeek V4.1: " + detail);
     return std::make_shared<Runner>(
         std::move(model), options.session_count, use_dspark,
-        use_dspark ? options.speculative.max_draft_tokens : 1u);
+        use_dspark ? options.speculative.max_draft_tokens : 1u,
+        std::move(artifact_fingerprint), std::move(support_fingerprint));
   } catch (const std::exception& exception) {
     if (error)
       *error = exception.what();
