@@ -221,17 +221,27 @@ void CheckRoundTrip(ds41::ContinuationAdapter& adapter, bool speculative,
 
   const auto checkpoint = Capture(adapter, *source, streams);
   auto& original = adapter.GetSession(*source);
-  const auto expected_bytes = Bytes(original);
   Load(adapter, *target, checkpoint, streams);
   Require(adapter.Validate(*target, checkpoint.positions),
           "complete restore failed validation");
   Reject([&] { (void)adapter.Validate(*target, checkpoint.positions); });
   auto& restored = adapter.GetSession(*target);
-  const auto actual_bytes = Bytes(restored);
-  RequireSameSnapshot(expected_bytes, actual_bytes,
-                      "restored state differs from the source session",
-                      speculative, tokens,
-                      checkpoint.positions.front().valid_rows);
+  if (speculative) {
+    // The native snapshot also holds the DSpark ring. Only the valid rows and
+    // private state are continuation state; the unused ring rows reset.
+    const auto restored_checkpoint = Capture(adapter, *target, streams);
+    Require(restored_checkpoint.positions == checkpoint.positions,
+            "restored continuation positions differ");
+    Require(restored_checkpoint.bytes == checkpoint.bytes,
+            "restored continuation state differs");
+  } else {
+    const auto expected_bytes = Bytes(original);
+    const auto actual_bytes = Bytes(restored);
+    RequireSameSnapshot(expected_bytes, actual_bytes,
+                        "restored state differs from the source session",
+                        speculative, tokens,
+                        checkpoint.positions.front().valid_rows);
+  }
   Require(restored.CopyLogits() == original.CopyLogits(),
           "restored logits differ");
   Require(Continue(restored, speculative, 24) ==
@@ -246,10 +256,19 @@ void CheckRoundTrip(ds41::ContinuationAdapter& adapter, bool speculative,
           "invalidate left a frontier");
   Load(adapter, *target, later, streams);
   Require(adapter.Validate(*target, later.positions), "later restore failed");
-  const auto later_actual = Bytes(adapter.GetSession(*target));
-  const auto later_expected = Bytes(adapter.GetSession(*source));
-  RequireSameSnapshot(later_expected, later_actual, "later restore differs",
-                      speculative, tokens, later.positions.front().valid_rows);
+  if (speculative) {
+    const auto later_actual = Capture(adapter, *target, streams);
+    Require(later_actual.positions == later.positions,
+            "later restore positions differ");
+    Require(later_actual.bytes == later.bytes,
+            "later restore continuation state differs");
+  } else {
+    const auto later_actual = Bytes(adapter.GetSession(*target));
+    const auto later_expected = Bytes(adapter.GetSession(*source));
+    RequireSameSnapshot(later_expected, later_actual, "later restore differs",
+                        speculative, tokens,
+                        later.positions.front().valid_rows);
+  }
 }
 
 void CheckRefusals(ds41::ContinuationAdapter& adapter,
