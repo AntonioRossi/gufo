@@ -79,9 +79,8 @@ TTS requests use checkpoint sampling, fixed seeds and a 180-codec-step cap.
 TTS intelligibility requires an explicitly selected ASR evaluator binary. Pin its
 revision and checkpoint independently when changing ASR or TTS runtime behavior;
 using the same candidate as its own evaluator does not qualify those changes.
-The current ASR malformed-WAV path returns `500 transcription_failed` rather than
-400. The suite records this known limitation and checks its exact error and
-subsequent recovery; it does not claim correct client-error classification.
+A malformed ASR WAV must return `400 invalid_audio_input`, and the server must
+recover for the next request.
 
 Every invocation requires a new output directory. `report.json` retains status,
 per-case results, request timings and headers (including available server phase
@@ -174,6 +173,21 @@ nix develop -c python3 tests/functional/cache_alignment_qwen38.py \
 
 Add `--mtp-model /path/to/mtp.gguf` before `--` for the MTP mode. The test owns
 its servers, cache directory and loopback listener.
+
+A second question about the same long document has a focused disk check.
+The first question seeds `--cache-disk`; after a restart, the second question
+must restore at least `--min-cached` tokens of the document from disk. Its
+greedy reply must equal the same request on a fresh server without a cache:
+
+```sh
+nix develop -c python3 tests/functional/cache_document_qwen38.py \
+  --output /tmp/cache-document --min-cached 12288 -- \
+  /path/to/production/gufo serve llm --model /path/to/flash-next.gguf \
+  --context 65536
+```
+
+The test owns its servers, cache directory and loopback listener, and retains
+each request's usage, timings and server log.
 
 Flash-Next MTP and Qwen27B DFlash2 prompt lookup have a focused runner. It
 requires actual accepted copies, compares isolated and C2/C4/C6/C8 requests under greedy and the model's

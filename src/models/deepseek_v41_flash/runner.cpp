@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <gufo/ext/component_cache_resources.hpp>
+#include <gufo/ext/gguf_identity.hpp>
 #include <gufo/ext/host.hpp>
 #include <limits>
 #include <mutex>
@@ -11,7 +12,6 @@
 #include <utility>
 #include <vector>
 
-#include "src/core/gguf_identity.hpp"
 #include "src/models/deepseek_v41_flash/continuation_adapter.hpp"
 #include "src/models/deepseek_v41_flash/continuation_identity.hpp"
 #include "src/models/deepseek_v41_flash/dspark_sampler.hpp"
