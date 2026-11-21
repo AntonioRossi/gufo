@@ -1,0 +1,43 @@
+{
+  "schema": 1,
+  "name": "hy4_flash",
+  "version": "0.1.0",
+  "api_version": ">= 0.3.0",
+  "entry": "hy4_flash_register",
+  "registration_target": "gufo_hy4_flash",
+  "depends": [],
+  "platforms": [
+    "linux"
+  ],
+  "providers": [
+    {
+      "id": "hy4-flash",
+      "capability": "text_generation",
+      "keys": [
+        "gguf:hy_v4_flash"
+      ],
+      "model_ids": [
+        "hy4-flash"
+      ],
+      "target": "gufo_hy4_flash_hip",
+      "entry": "hy4_flash_provider_register"
+    }
+  ],
+  "options": [],
+  "targets": {
+    "gufo_hy4_flash": {
+      "requires": []
+    },
+    "gufo_hy4_flash_hip": {
+      "requires": [
+        "hip"
+      ]
+    },
+    "hy4_flash_tests": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
+    }
+  }
+}
