@@ -268,14 +268,14 @@ bool ProbeHy4Flash(std::string_view model_root) {
   }
 }
 
-bool VerifyHy4FlashModel(std::string_view model_root, std::string* error) {
+bool VerifyHy4FlashPack(std::string_view model_root,
+                        const core::GgufReader& reader, std::string* error) {
   try {
-    std::unique_ptr<core::GgufReader> reader;
-    if (!OpenModel(model_root, &reader, error) || !CheckModel(*reader, error)) {
+    if (!CheckModel(reader, error)) {
       return false;
     }
     const auto path = std::filesystem::path(model_root);
-    const auto regions = reader->GetMappedRegions();
+    const auto regions = reader.GetMappedRegions();
     if (regions.empty() ||
         Canonical(regions.front().source_path) != Canonical(path)) {
       return Fail(error, "the first shard was not opened");
@@ -285,7 +285,19 @@ bool VerifyHy4FlashModel(std::string_view model_root, std::string* error) {
     if (!std::filesystem::exists(pack, exists_error)) {
       return Fail(error, "missing pack " + pack.string());
     }
-    return VerifyPack(pack, *reader, error);
+    return VerifyPack(pack, reader, error);
+  } catch (const std::exception& exception) {
+    return Fail(error, exception.what());
+  }
+}
+
+bool VerifyHy4FlashModel(std::string_view model_root, std::string* error) {
+  try {
+    std::unique_ptr<core::GgufReader> reader;
+    if (!OpenModel(model_root, &reader, error)) {
+      return false;
+    }
+    return VerifyHy4FlashPack(model_root, *reader, error);
   } catch (const std::exception& exception) {
     return Fail(error, exception.what());
   }

@@ -23,7 +23,22 @@
       "entry": "hy4_flash_provider_register"
     }
   ],
-  "options": [],
+  "options": [
+    {
+      "name": "--hy4-draft",
+      "type": "string",
+      "commands": [
+        "prompt",
+        "chat",
+        "bench",
+        "serve"
+      ],
+      "providers": [
+        "hy4-flash"
+      ],
+      "help": "Draft mode: none or dfly2"
+    }
+  ],
   "targets": {
     "gufo_hy4_flash": {
       "requires": []
