@@ -12,6 +12,13 @@ inline constexpr std::string_view kShard1Name =
     "Hy4-Fixture-00001-of-00002.gguf";
 inline constexpr std::string_view kShard2Name =
     "Hy4-Fixture-00002-of-00002.gguf";
+inline constexpr std::string_view kVisionName = "Hy4-Fixture-mmproj.gguf";
+inline constexpr std::string_view kVisionSplit1Name =
+    "Hy4-Fixture-mmproj-00001-of-00002.gguf";
+inline constexpr std::string_view kVisionSplit2Name =
+    "Hy4-Fixture-mmproj-00002-of-00002.gguf";
+inline constexpr std::string_view kDrafterName = "Hy4-Fixture-drafter.dfly2";
+inline constexpr std::string_view kMtpName = "Hy4-Fixture-mtp.gguf";
 
 struct Fixture {
   std::string architecture{"hy_v4_flash"};
@@ -37,6 +44,24 @@ struct Fixture {
   std::uint32_t nextn_predict_layers{0};
   bool include_engram{true};
   bool truncate_engram{false};
+  std::string vision_type{"mmproj"};
+  std::string vision_architecture{"clip"};
+  std::string vision_projector_type{"hy_v4_flash"};
+  std::uint32_t vision_embedding_length{4};
+  std::uint32_t vision_dim{4};
+  std::uint32_t dfly_block_count{1};
+  std::uint32_t dfly_layers{1};
+  std::string companion_tensor_name{"vision.test.weight"};
+  bool include_mtp{false};
+  bool split_vision{false};
+  std::string drafter_type{"drafter"};
+  std::string drafter_architecture{"hy_v4_flash_dfly"};
+};
+
+struct PackOptions {
+  bool include_companions{true};
+  bool split_vision{false};
+  bool include_mtp{false};
 };
 
 struct PackedTensor {
@@ -51,10 +76,16 @@ struct PackedTensor {
 struct BuiltPair {
   std::vector<std::uint8_t> shard1;
   std::vector<std::uint8_t> shard2;
+  std::vector<std::uint8_t> vision;
+  std::vector<std::uint8_t> vision2;
+  std::vector<std::uint8_t> drafter;
+  std::vector<std::uint8_t> mtp;
   std::vector<PackedTensor> tensors;
+  std::uint32_t vision_dim{4};
+  std::uint32_t dfly_layers{1};
 };
 
-/// A two-shard set: the trunk in shard 1, the Engram table in shard 2.
+/// The two-shard trunk with the vision and drafter companions.
 BuiltPair BuildPair(const Fixture& fixture);
 
 /// All tensors in one image with the split metadata, for metadata checks.
@@ -63,8 +94,9 @@ std::vector<std::uint8_t> BuildSingle(const Fixture& fixture);
 bool WritePair(const std::filesystem::path& dir, const BuiltPair& pair,
                std::string* error);
 
-/// Writes `hy4.txt` and `tensors.txt` from the same tensor list.
+/// Writes `hy4.txt` and `tensors.txt` from the same tensor list. The options
+/// select the companion files, the split vision set, and the MTP file.
 bool WritePack(const std::filesystem::path& dir, const BuiltPair& pair,
-               std::string* error);
+               const PackOptions& options, std::string* error);
 
 }  // namespace hy4_test

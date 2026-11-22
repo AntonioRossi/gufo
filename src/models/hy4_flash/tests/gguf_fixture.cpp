@@ -176,7 +176,8 @@ void AddTensor(std::vector<TensorSpec>* tensors, std::string name,
   tensors->push_back({std::move(name), type, std::move(dimensions), file});
 }
 
-std::vector<TensorSpec> MakeTensors(const Fixture& fixture) {
+std::vector<TensorSpec> MakeTensors(const Fixture& fixture,
+                                    bool include_companions) {
   std::vector<TensorSpec> tensors;
   for (std::uint32_t layer = 0; layer < fixture.block_count; ++layer) {
     const std::string prefix = "blk." + std::to_string(layer) + ".";
@@ -205,11 +206,26 @@ std::vector<TensorSpec> MakeTensors(const Fixture& fixture) {
                 {256, 1}, 0);
     }
   }
+  AddTensor(&tensors, "output.weight", kTypeF32, {4}, 0);
   if (fixture.include_engram) {
     const auto width =
         fixture.engram_width != 0 ? fixture.engram_width : fixture.width;
     AddTensor(&tensors, std::string(kEngramTensor), fixture.engram_type,
               {width, fixture.rows}, 1);
+  }
+  if (include_companions) {
+    if (fixture.split_vision) {
+      AddTensor(&tensors, "vision.0.weight", kTypeF32, {4}, 2);
+      AddTensor(&tensors, "vision.1.weight", kTypeF32, {4}, 3);
+    } else {
+      AddTensor(&tensors, fixture.companion_tensor_name, kTypeF32, {4}, 2);
+    }
+    AddTensor(&tensors, "drafter.test.weight", kTypeF32, {4},
+              fixture.split_vision ? 4 : 3);
+    if (fixture.include_mtp) {
+      AddTensor(&tensors, "mtp.test.weight", kTypeF32, {4},
+                fixture.split_vision ? 5 : 4);
+    }
   }
   return tensors;
 }
@@ -264,16 +280,55 @@ std::vector<std::uint8_t> Header(const std::vector<Meta>& meta,
   return out;
 }
 
-std::vector<std::uint8_t> BuildShard(
-    const std::vector<TensorSpec>& tensors, const Fixture& fixture,
-    std::uint32_t split_no, std::uint64_t total_tensors, bool truncate,
+std::vector<std::uint8_t> BuildContainer(
+    std::vector<Meta> meta, const std::vector<TensorSpec>& tensors,
+    bool truncate,
     std::vector<std::pair<std::string, std::uint64_t>>* absolute) {
   auto sorted = tensors;
   std::sort(sorted.begin(), sorted.end(),
             [](const TensorSpec& left, const TensorSpec& right) {
               return left.name < right.name;
             });
+  std::sort(meta.begin(), meta.end(), [](const Meta& left, const Meta& right) {
+    return left.key < right.key;
+  });
 
+  std::vector<std::uint64_t> offsets(sorted.size(), 0);
+  const auto provisional = Header(meta, sorted, offsets);
+  const auto data_start = Align(provisional.size());
+
+  std::vector<std::uint64_t> sizes(sorted.size(), 0);
+  std::uint64_t offset = 0;
+  for (std::size_t index = 0; index < sorted.size(); ++index) {
+    sizes[index] = TensorBytes(sorted[index].type, sorted[index].dimensions);
+    offsets[index] = offset;
+    offset = Align(offset + sizes[index]);
+  }
+  std::uint64_t data_bytes = offset;
+  if (truncate) {
+    for (std::size_t index = 0; index < sorted.size(); ++index) {
+      if (sorted[index].name == kEngramTensor && sizes[index] != 0) {
+        data_bytes = offsets[index] + sizes[index] / 2;
+        break;
+      }
+    }
+  }
+
+  auto bytes = Header(meta, sorted, offsets);
+  bytes.resize(data_start + data_bytes, 0);
+  if (absolute != nullptr) {
+    absolute->clear();
+    for (std::size_t index = 0; index < sorted.size(); ++index) {
+      absolute->push_back({sorted[index].name, data_start + offsets[index]});
+    }
+  }
+  return bytes;
+}
+
+std::vector<std::uint8_t> BuildShard(
+    const std::vector<TensorSpec>& tensors, const Fixture& fixture,
+    std::uint32_t split_no, std::uint64_t total_tensors, bool truncate,
+    std::vector<std::pair<std::string, std::uint64_t>>* absolute) {
   std::vector<Meta> meta;
   AddString(meta, "general.architecture", fixture.architecture);
   if (!fixture.general_type.empty()) {
@@ -298,56 +353,108 @@ std::vector<std::uint8_t> BuildShard(
   AddU16(meta, "split.count", static_cast<std::uint16_t>(fixture.split_count));
   AddU16(meta, "split.no", static_cast<std::uint16_t>(split_no));
   AddI32(meta, "split.tensors.count", static_cast<std::int32_t>(total_tensors));
-  std::sort(meta.begin(), meta.end(), [](const Meta& left, const Meta& right) {
-    return left.key < right.key;
-  });
+  return BuildContainer(std::move(meta), tensors, truncate, absolute);
+}
 
-  std::vector<std::uint64_t> offsets(sorted.size(), 0);
-  const auto provisional = Header(meta, sorted, offsets);
-  const auto data_start = Align(provisional.size());
-
-  std::vector<std::uint64_t> sizes(sorted.size(), 0);
-  std::uint64_t offset = 0;
-  for (std::size_t index = 0; index < sorted.size(); ++index) {
-    sizes[index] = TensorBytes(sorted[index].type, sorted[index].dimensions);
-    offsets[index] = offset;
-    offset = Align(offset + sizes[index]);
-  }
-  std::uint64_t data_bytes = offset;
-  if (truncate && !sorted.empty() && sorted.back().name == kEngramTensor &&
-      sizes.back() != 0) {
-    data_bytes = offsets.back() + sizes.back() / 2;
-  }
-
-  auto bytes = Header(meta, sorted, offsets);
-  bytes.resize(data_start + data_bytes, 0);
-  if (absolute != nullptr) {
-    absolute->clear();
-    for (std::size_t index = 0; index < sorted.size(); ++index) {
-      absolute->push_back({sorted[index].name, data_start + offsets[index]});
-    }
-  }
-  return bytes;
+std::vector<std::uint8_t> BuildCompanion(
+    const std::vector<TensorSpec>& tensors, std::vector<Meta> meta,
+    std::vector<std::pair<std::string, std::uint64_t>>* absolute) {
+  return BuildContainer(std::move(meta), tensors, false, absolute);
 }
 
 }  // namespace
 
 BuiltPair BuildPair(const Fixture& fixture) {
-  auto tensors = MakeTensors(fixture);
+  auto tensors = MakeTensors(fixture, true);
   std::vector<TensorSpec> trunk;
   std::vector<TensorSpec> engram;
+  std::vector<TensorSpec> vision;
+  std::vector<TensorSpec> vision2;
+  std::vector<TensorSpec> drafter;
+  std::vector<TensorSpec> mtp;
   for (const auto& tensor : tensors) {
-    (tensor.file == 0 ? trunk : engram).push_back(tensor);
+    if (tensor.file == 0) {
+      trunk.push_back(tensor);
+    } else if (tensor.file == 1) {
+      engram.push_back(tensor);
+    } else if (tensor.file == 2) {
+      vision.push_back(tensor);
+    } else if (tensor.file == 3) {
+      (fixture.split_vision ? vision2 : drafter).push_back(tensor);
+    } else if (tensor.file == 4) {
+      (fixture.split_vision ? drafter : mtp).push_back(tensor);
+    } else {
+      mtp.push_back(tensor);
+    }
   }
+  const auto split_tensors = trunk.size() + engram.size();
   BuiltPair pair;
+  pair.vision_dim = fixture.vision_dim;
+  pair.dfly_layers = fixture.dfly_layers;
   std::vector<std::pair<std::string, std::uint64_t>> trunk_offsets;
   std::vector<std::pair<std::string, std::uint64_t>> engram_offsets;
+  std::vector<std::pair<std::string, std::uint64_t>> vision_offsets;
+  std::vector<std::pair<std::string, std::uint64_t>> vision2_offsets;
+  std::vector<std::pair<std::string, std::uint64_t>> drafter_offsets;
+  std::vector<std::pair<std::string, std::uint64_t>> mtp_offsets;
   pair.shard1 =
-      BuildShard(trunk, fixture, 0, tensors.size(), false, &trunk_offsets);
-  pair.shard2 = BuildShard(engram, fixture, 1, tensors.size(),
+      BuildShard(trunk, fixture, 0, split_tensors, false, &trunk_offsets);
+  pair.shard2 = BuildShard(engram, fixture, 1, split_tensors,
                            fixture.truncate_engram, &engram_offsets);
+
+  std::vector<Meta> vision_meta;
+  AddString(vision_meta, "general.architecture", fixture.vision_architecture);
+  AddString(vision_meta, "general.type", fixture.vision_type);
+  AddString(vision_meta, "clip.projector_type", fixture.vision_projector_type);
+  AddU32(vision_meta, "clip.vision.embedding_length",
+         fixture.vision_embedding_length);
+  if (fixture.split_vision) {
+    AddU16(vision_meta, "split.count", 2);
+    AddU16(vision_meta, "split.no", 0);
+    AddI32(vision_meta, "split.tensors.count",
+           static_cast<std::int32_t>(vision.size() + vision2.size()));
+  }
+  pair.vision = BuildCompanion(vision, vision_meta, &vision_offsets);
+  if (fixture.split_vision) {
+    std::vector<Meta> vision2_meta;
+    AddString(vision2_meta, "general.architecture",
+              fixture.vision_architecture);
+    AddString(vision2_meta, "general.type", fixture.vision_type);
+    AddString(vision2_meta, "clip.projector_type",
+              fixture.vision_projector_type);
+    AddU32(vision2_meta, "clip.vision.embedding_length",
+           fixture.vision_embedding_length);
+    AddU16(vision2_meta, "split.count", 2);
+    AddU16(vision2_meta, "split.no", 1);
+    AddI32(vision2_meta, "split.tensors.count",
+           static_cast<std::int32_t>(vision.size() + vision2.size()));
+    pair.vision2 = BuildCompanion(vision2, vision2_meta, &vision2_offsets);
+  }
+
+  std::vector<Meta> drafter_meta;
+  AddString(drafter_meta, "general.architecture", fixture.drafter_architecture);
+  AddString(drafter_meta, "general.type", fixture.drafter_type);
+  AddU32(drafter_meta, "hy_v4_flash_dfly.block_count",
+         fixture.dfly_block_count);
+  pair.drafter = BuildCompanion(drafter, drafter_meta, &drafter_offsets);
+
+  if (fixture.include_mtp) {
+    std::vector<Meta> mtp_meta;
+    AddString(mtp_meta, "general.architecture", "hy_v4_flash");
+    AddString(mtp_meta, "general.type", "mtp");
+    pair.mtp = BuildCompanion(mtp, mtp_meta, &mtp_offsets);
+  }
+
   for (const auto& tensor : tensors) {
-    const auto& offsets = tensor.file == 0 ? trunk_offsets : engram_offsets;
+    const auto& offsets =
+        tensor.file == 0   ? trunk_offsets
+        : tensor.file == 1 ? engram_offsets
+        : tensor.file == 2 ? vision_offsets
+        : tensor.file == 3
+            ? (fixture.split_vision ? vision2_offsets : drafter_offsets)
+        : tensor.file == 4
+            ? (fixture.split_vision ? drafter_offsets : mtp_offsets)
+            : mtp_offsets;
     const auto found = std::find_if(
         offsets.begin(), offsets.end(),
         [&](const auto& entry) { return entry.first == tensor.name; });
@@ -360,7 +467,7 @@ BuiltPair BuildPair(const Fixture& fixture) {
 }
 
 std::vector<std::uint8_t> BuildSingle(const Fixture& fixture) {
-  auto tensors = MakeTensors(fixture);
+  auto tensors = MakeTensors(fixture, false);
   std::vector<std::pair<std::string, std::uint64_t>> offsets;
   return BuildShard(tensors, fixture, 0, tensors.size(),
                     fixture.truncate_engram, &offsets);
@@ -368,12 +475,26 @@ std::vector<std::uint8_t> BuildSingle(const Fixture& fixture) {
 
 bool WritePair(const std::filesystem::path& dir, const BuiltPair& pair,
                std::string* error) {
-  return WriteFile(dir / kShard1Name, pair.shard1, error) &&
-         WriteFile(dir / kShard2Name, pair.shard2, error);
+  const auto vision_name =
+      pair.vision2.empty() ? kVisionName : kVisionSplit1Name;
+  if (!WriteFile(dir / kShard1Name, pair.shard1, error) ||
+      !WriteFile(dir / kShard2Name, pair.shard2, error) ||
+      !WriteFile(dir / vision_name, pair.vision, error) ||
+      !WriteFile(dir / kDrafterName, pair.drafter, error)) {
+    return false;
+  }
+  if (!pair.vision2.empty() &&
+      !WriteFile(dir / kVisionSplit2Name, pair.vision2, error)) {
+    return false;
+  }
+  if (!pair.mtp.empty() && !WriteFile(dir / kMtpName, pair.mtp, error)) {
+    return false;
+  }
+  return true;
 }
 
 bool WritePack(const std::filesystem::path& dir, const BuiltPair& pair,
-               std::string* error) {
+               const PackOptions& options, std::string* error) {
   const auto pack = dir / "maya-hy4";
   std::error_code create_error;
   std::filesystem::create_directories(pack, create_error);
@@ -386,7 +507,9 @@ bool WritePack(const std::filesystem::path& dir, const BuiltPair& pair,
       return FailWrite(error, (pack / "hy4.txt").string() + ": cannot open");
     }
     geometry << "arch hy_v4_flash\nmodel_dir "
-             << std::filesystem::absolute(dir).string() << "\n";
+             << std::filesystem::absolute(dir).string() << "\n"
+             << "vision.dim " << pair.vision_dim << "\n"
+             << "dfly_layers " << pair.dfly_layers << "\n";
     geometry.close();
     if (!geometry) {
       return FailWrite(error, (pack / "hy4.txt").string() + ": write failed");
@@ -398,7 +521,26 @@ bool WritePack(const std::filesystem::path& dir, const BuiltPair& pair,
   }
   index << "file 0 " << kShard1Name << "\n";
   index << "file 1 " << kShard2Name << "\n";
+  if (options.include_companions) {
+    index << "file 2 "
+          << (options.split_vision ? kVisionSplit1Name : kVisionName) << "\n";
+    if (options.split_vision) {
+      index << "file 3 " << kVisionSplit2Name << "\n";
+      index << "file 4 " << kDrafterName << "\n";
+      if (options.include_mtp) {
+        index << "file 5 " << kMtpName << "\n";
+      }
+    } else {
+      index << "file 3 " << kDrafterName << "\n";
+      if (options.include_mtp) {
+        index << "file 4 " << kMtpName << "\n";
+      }
+    }
+  }
   for (const auto& tensor : pair.tensors) {
+    if (!options.include_companions && tensor.file >= 2) {
+      continue;
+    }
     index << "t " << tensor.name << ' ' << tensor.type << ' ' << tensor.file
           << ' ' << tensor.offset << ' ' << tensor.bytes;
     for (const auto dimension : tensor.dimensions) {
