@@ -10,6 +10,7 @@ use png::{BitDepth, ColorType, Decoder, InterlaceInfo, Reader, Transformations};
 const MAX_DIMENSION: u32 = 1_000_000;
 
 const RGB8_BITS_PER_PIXEL: u8 = 24;
+const RGBA8_BITS_PER_PIXEL: u8 = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -78,6 +79,43 @@ impl Layout {
                 .zip(rgb)
                 .for_each(|(sample, out)| {
                     *out = [u16::from_be_bytes(*sample).min(255) as u8; 3];
+                }),
+        }
+    }
+
+    fn to_rgba8(self, row: &[u8], rgba: &mut [u8]) {
+        let rgba = rgba.as_chunks_mut::<4>().0;
+        match self {
+            Self::Gray8 => row
+                .iter()
+                .zip(rgba)
+                .for_each(|(&g, out)| *out = [g, g, g, 255]),
+            Self::GrayAlpha8 => row
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .zip(rgba)
+                .for_each(|(ga, out)| *out = [ga[0], ga[0], ga[0], ga[1]]),
+            Self::Rgb8 => row
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .zip(rgba)
+                .for_each(|(px, out)| *out = [px[0], px[1], px[2], 255]),
+            Self::Rgba8 => row
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(rgba)
+                .for_each(|(px, out)| *out = *px),
+            Self::Gray16 => row
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .zip(rgba)
+                .for_each(|(sample, out)| {
+                    let gray = u16::from_be_bytes(*sample).min(255) as u8;
+                    *out = [gray, gray, gray, 255];
                 }),
         }
     }
@@ -176,6 +214,10 @@ impl Png<'_> {
     pub fn decode_rgb8(self, rgb: &mut [u8]) -> Result<(), Error> {
         decode_rgb8(self.reader, rgb)
     }
+
+    pub fn decode_rgba8(self, rgba: &mut [u8]) -> Result<(), Error> {
+        decode_rgba8(self.reader, rgba)
+    }
 }
 
 fn decode_rgb8(mut reader: Reader<Cursor<Cow<'_, [u8]>>>, rgb: &mut [u8]) -> Result<(), Error> {
@@ -209,6 +251,43 @@ fn decode_rgb8(mut reader: Reader<Cursor<Cow<'_, [u8]>>>, rgb: &mut [u8]) -> Res
                     .map_err(|_| Error::Invalid)?
                     .ok_or(Error::Internal)?;
                 layout.to_rgb8(row.data(), out);
+            }
+        }
+    }
+    reader.finish().map_err(|_| Error::Invalid)
+}
+
+fn decode_rgba8(mut reader: Reader<Cursor<Cow<'_, [u8]>>>, rgba: &mut [u8]) -> Result<(), Error> {
+    let (width, height) = reader.info().size();
+    let stride = width as usize * 4;
+    if stride.checked_mul(height as usize) != Some(rgba.len()) {
+        return Err(Error::Internal);
+    }
+    let layout = Layout::of(reader.output_color_type()).ok_or(Error::Internal)?;
+    if reader.info().interlaced {
+        let mut pass_rgba = vec![0; stride];
+        while let Some(row) = reader.next_interlaced_row().map_err(|_| Error::Invalid)? {
+            let InterlaceInfo::Adam7(pass) = row.interlace() else {
+                return Err(Error::Internal);
+            };
+            let pixels = row.data().len() / layout.bytes_per_pixel();
+            let pass_rgba = &mut pass_rgba[..pixels * 4];
+            layout.to_rgba8(row.data(), pass_rgba);
+            png::expand_interlaced_row(rgba, stride, pass_rgba, pass, RGBA8_BITS_PER_PIXEL);
+        }
+    } else {
+        for out in rgba.chunks_exact_mut(stride) {
+            if layout == Layout::Rgba8 {
+                reader
+                    .read_row(out)
+                    .map_err(|_| Error::Invalid)?
+                    .ok_or(Error::Internal)?;
+            } else {
+                let row = reader
+                    .next_row()
+                    .map_err(|_| Error::Invalid)?
+                    .ok_or(Error::Internal)?;
+                layout.to_rgba8(row.data(), out);
             }
         }
     }

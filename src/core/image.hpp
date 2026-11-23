@@ -22,8 +22,25 @@ struct Image {
   std::vector<std::uint8_t> pixels;
 };
 
+/// Decode choices that do not apply to the historical callers.
+struct ImageDecodeOptions {
+  /// Composite PNG colour types 3, 4 and 6 and transparent WebP over white.
+  /// PNG colour types 0 and 2 keep their gray or RGB colour-key values. The
+  /// default drops alpha without compositing, as the historical callers expect.
+  bool composite_over_white{false};
+  /// Apply the WebP EXIF orientation. PNG and JPEG always apply theirs.
+  bool apply_webp_exif{false};
+};
+
 /// PNG, JPEG and WebP. Decoding checks dimensions before allocating pixels.
 [[nodiscard]] Image DecodeImage(std::span<const std::uint8_t> bytes);
+/// The same formats with explicit alpha and WebP EXIF choices.
+[[nodiscard]] Image DecodeImage(std::span<const std::uint8_t> bytes,
+                                const ImageDecodeOptions& options);
+/// Two-pass Lanczos resize of packed RGB8 with Pillow parity.
+[[nodiscard]] bool ResizeRgb8(const std::vector<std::uint8_t>& source,
+                              int source_width, int source_height, int width,
+                              int height, std::vector<std::uint8_t>* output);
 [[nodiscard]] std::vector<std::uint8_t> ReadImageFile(
     const std::filesystem::path& path);
 /// Shared across all messages of one HTTP request.

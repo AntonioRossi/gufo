@@ -140,6 +140,12 @@ toolchain: GCC 16.2 and ROCm 10.1.0. Without Nix, install these first:
 | FFmpeg libraries | EmbeddingGemma 2 only |
 | `ffmpeg` and `ffprobe` | Video and audio output |
 
+For a HIP build that includes Hy4, set `HY4_MAYA` to the project-maya
+source directory and `STRATA_GGML_DIR` to the llama.cpp source directory.
+Use the `hy4-maya` and `hy4-ggml` revisions in `flake.lock`. In the parent
+workspace, these directories are `_vendors/project-maya` and
+`_vendors/llama.cpp`. The fork's Nix development shell sets both paths.
+
 On Debian or Ubuntu, with
 [AMD's ROCm repository](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/)
 set up:

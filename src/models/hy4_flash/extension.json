@@ -53,6 +53,13 @@
         "testing"
       ],
       "role": "test"
+    },
+    "hy4_flash_kernels_test": {
+      "requires": [
+        "hip",
+        "testing"
+      ],
+      "role": "test"
     }
   }
 }

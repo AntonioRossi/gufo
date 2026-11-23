@@ -3,6 +3,14 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    hy4-maya = {
+      url = "git+https://github.com/mw00/project-maya.git";
+      flake = false;
+    };
+    hy4-ggml = {
+      url = "git+https://github.com/ggml-org/llama.cpp.git";
+      flake = false;
+    };
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -27,7 +35,7 @@
   };
 
   outputs =
-    { self, nixpkgs, nixpkgs-rocm10, audio-cpp, rust-overlay }:
+    { self, nixpkgs, nixpkgs-rocm10, audio-cpp, rust-overlay, hy4-maya, hy4-ggml }:
     let
       # Strix Halo is a Linux x86-64-only target (see README non-goals).
       forAllSystems = nixpkgs.lib.genAttrs [ "x86_64-linux" ];
@@ -40,6 +48,11 @@
         assert builtins.match "[0-9]+\\.[0-9]+\\.[0-9]+" value != null;
         value;
       revision = self.shortRev or self.dirtyShortRev or "dirty";
+      hy4Sources = {
+        HY4_MAYA = toString hy4-maya;
+        STRATA_GGML_DIR = toString hy4-ggml;
+        HY4_GGML_COMMIT = builtins.substring 0 9 (hy4-ggml.rev or "");
+      };
 
       # Reuse the cached ROCm closure, including its matching compiler/runtime.
       # Python and general dependencies stay on the nixos-unstable input.
@@ -58,7 +71,7 @@
       gufoPackages = forAllSystems (
         system:
         pkgs.${system}.callPackage ./.devops/nix/scope.nix {
-          inherit revision;
+          inherit revision hy4Sources;
           rustToolchain = rustToolchains.${system};
           rocmPackages = pkgs.${system}.rocmPackages.gfx1151;
         }
@@ -808,7 +821,7 @@
                 rocmPackages = pkgs.${system}.rocmPackages.gfx1151;
               })
             ];
-            env = {
+            env = hy4Sources // {
               TORCH_HOME = "${alexnetTorchHome system}";
               # CMake finds XRT here, and XRT its amdxdna plugin.
               XILINX_XRT = "${gufoPackages.${system}.xrt-amdxdna}/opt/xilinx/xrt";

@@ -16,14 +16,11 @@
 //      Qwen2VLImageProcessorFast semantics): canvas RGB8 -> KeyframeVision
 //      rows for the vision tower.
 //
-// The Lanczos resampler is Pillow-parity 22-bit fixed-point with per-pass
-// uint8 rounding, copied into this model-private file from
-// src/models/qwen_image_21/image.cpp (ResizeImage / LanczosFilters, lines
-// 45-73 and 179-237, attribution at the implementation). Inputs are
-// core::Image RGB8 already in display orientation (core::DecodeImage
-// applies EXIF), so no alpha or premultiplication handling is required;
-// ffmpeg's lanczos is NOT pixel-identical to Pillow and is unusable here
-// (#177 gates pixel parity).
+// The shared core::ResizeRgb8 is Pillow-parity 22-bit fixed-point with
+// per-pass uint8 rounding. Inputs are core::Image RGB8 already in display
+// orientation (core::DecodeImage applies EXIF), so no alpha or
+// premultiplication handling is required; ffmpeg's lanczos is NOT
+// pixel-identical to Pillow and is unusable here (#177 gates pixel parity).
 
 #include <cstdint>
 #include <gufo/ext/image.hpp>

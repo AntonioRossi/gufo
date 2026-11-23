@@ -21,6 +21,8 @@ Non-Nix builds must retain the notices of the versions they actually distribute.
 | rocWMMA | Headers compiled into kernels | `MIT` | ROCm 7.2.3; flake.lock | [ROCm/rocWMMA](https://github.com/ROCm/rocWMMA) |
 | Composable Kernel | Adapted short-attention arithmetic; no library/header dependency | `MIT` | ROCm 7.2.3; flake.lock | [ROCm/composable_kernel](https://github.com/ROCm/composable_kernel) |
 | ICU | Linked; Unicode normalization/tokenization | `Unicode-3.0` | 78.3; flake.lock | [unicode-org/icu](https://github.com/unicode-org/icu) |
+| Project Maya | Hy4 engine and kernels | `MIT` | `hy4-maya` in flake.lock | [mw00/project-maya](https://github.com/mw00/project-maya) |
+| llama.cpp / ggml for Hy4 | CPU kernels and headers | `MIT` | `hy4-ggml` in flake.lock | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) |
 | curl / libcurl | Linked; image HTTPS and evaluation client | `curl` | 8.21.0; flake.lock | [curl/curl](https://github.com/curl/curl) |
 | OpenSSL | Linked; cryptographic hashes and HTTPS dependency | `Apache-2.0` | 3.6.3; flake.lock | [openssl/openssl](https://github.com/openssl/openssl) |
 | libpng | Linked; Qwen-Image PNG input decoding and output encoding | `libpng-2.0` | 1.6.58; flake.lock | [pnggroup/libpng](https://github.com/pnggroup/libpng) |

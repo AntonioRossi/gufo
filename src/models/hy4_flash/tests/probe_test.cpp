@@ -1,23 +1,39 @@
 #include "../probe.hpp"
 
 #include <algorithm>
+#include <cctype>
+#include <charconv>
+#include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <gufo/ext/gguf_reader.hpp>
+#include <gufo/ext/json.hpp>
 #include <gufo/ext/registry.hpp>
 #include <gufo/ext/text.hpp>
+#include <iterator>
 #include <memory>
+#include <optional>
+#include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
 #include "../provider.hpp"
+#include "../tokenizer.hpp"
 #include "gguf_fixture.hpp"
+
+#ifdef HY4_IMAGE_CHECKS
+#include "../image_prep.hpp"
+#endif
+#include "../logit_check.hpp"
 
 void hy4_flash_register(gufo::ext::Registry& registry);
 
@@ -128,9 +144,423 @@ std::filesystem::path MakeDirectory() {
   return std::filesystem::path(created);
 }
 
+std::optional<std::string> ReadText(const std::filesystem::path& path,
+                                    std::string* error) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    if (error != nullptr) {
+      *error = path.string() + ": cannot open";
+    }
+    return std::nullopt;
+  }
+  return std::string(std::istreambuf_iterator<char>(input),
+                     std::istreambuf_iterator<char>());
+}
+
+std::optional<std::vector<int>> ReadIds(const std::filesystem::path& path,
+                                        std::string* error) {
+  const auto text = ReadText(path, error);
+  if (!text) {
+    return std::nullopt;
+  }
+  std::vector<int> ids;
+  std::size_t position = 0;
+  while (position < text->size()) {
+    while (position < text->size() &&
+           std::isspace(static_cast<unsigned char>((*text)[position]))) {
+      ++position;
+    }
+    if (position == text->size()) {
+      break;
+    }
+    std::size_t end = position;
+    while (end < text->size() &&
+           !std::isspace(static_cast<unsigned char>((*text)[end])) &&
+           (*text)[end] != ',') {
+      ++end;
+    }
+    int id = 0;
+    const auto result =
+        std::from_chars(text->data() + position, text->data() + end, id);
+    if (result.ec != std::errc{} || result.ptr != text->data() + end) {
+      if (error != nullptr) {
+        *error = path.string() + ": invalid ID field";
+      }
+      return std::nullopt;
+    }
+    ids.push_back(id);
+    position = end;
+    if (position < text->size() && (*text)[position] == ',') {
+      ++position;
+    }
+  }
+  return ids;
+}
+
+int RunStage1Tokenizer(int argc, char** argv) {
+  std::filesystem::path tokenizer;
+  std::filesystem::path short_prompt;
+  std::filesystem::path short_ids;
+  std::filesystem::path full_prompt;
+  std::filesystem::path full_ids;
+  int alias = -1;
+  for (int i = 2; i < argc; ++i) {
+    const std::string option = argv[i];
+    const auto value = [&]() -> std::string {
+      if (++i >= argc) {
+        throw CheckFailure{};
+      }
+      return argv[i];
+    };
+    if (option == "--tokenizer") {
+      tokenizer = value();
+    } else if (option == "--short") {
+      short_prompt = value();
+    } else if (option == "--short-ids") {
+      short_ids = value();
+    } else if (option == "--full") {
+      full_prompt = value();
+    } else if (option == "--full-ids") {
+      full_ids = value();
+    } else if (option == "--alias") {
+      alias = std::stoi(value());
+    } else {
+      std::fprintf(stderr, "unknown argument: %s\n", option.c_str());
+      return 2;
+    }
+  }
+  Require("tokenizer directory", std::filesystem::is_directory(tokenizer));
+  Require("short prompt", std::filesystem::is_regular_file(short_prompt));
+  Require("short ids", std::filesystem::is_regular_file(short_ids));
+  Require("full prompt", std::filesystem::is_regular_file(full_prompt));
+  Require("full ids", std::filesystem::is_regular_file(full_ids));
+  Require("alias argument", alias >= 0);
+
+  std::string error;
+  auto loaded = gufo::models::hy4_flash::Tokenizer::Load(tokenizer, &error);
+  Require("tokenizer load", loaded.has_value(), error);
+
+  std::string read_error;
+  const auto short_text = ReadText(short_prompt, &read_error);
+  Require("short prompt read", short_text.has_value(), read_error);
+  Require("short prompt empty", !short_text->empty());
+  const auto short_expected = ReadIds(short_ids, &read_error);
+  Require("short ids parse", short_expected.has_value(), read_error);
+  Require("short ids count", short_expected->size() == 10);
+  const auto short_actual = loaded->Encode(*short_text);
+  Require("short ids", short_actual == *short_expected,
+          std::to_string(short_actual.size()) + " vs " +
+              std::to_string(short_expected->size()));
+
+  const auto full_text = ReadText(full_prompt, &read_error);
+  Require("full prompt read", full_text.has_value(), read_error);
+  Require("full prompt empty", !full_text->empty());
+  const auto full_expected = ReadIds(full_ids, &read_error);
+  Require("full ids parse", full_expected.has_value(), read_error);
+  Require("full ids count", full_expected->size() == 524224);
+  const auto full_actual = loaded->Encode(*full_text);
+  Require("full ids", full_actual == *full_expected,
+          std::to_string(full_actual.size()) + " vs " +
+              std::to_string(full_expected->size()));
+
+  const auto meta_text = ReadText(tokenizer / "tokenizer.json", &read_error);
+  Require("tokenizer meta read", meta_text.has_value(), read_error);
+  const auto meta = gufo::json::parse(*meta_text);
+  const auto* aliases = meta.find("aliases");
+  Require("aliases", aliases != nullptr &&
+                         aliases->type() == gufo::json::Value::Type::kObject);
+  const auto* alias_value = aliases->find(std::to_string(alias));
+  Require("alias entry", alias_value != nullptr && alias_value->is_string());
+  const std::string alias_expected = alias_value->str();
+  const auto alias_actual = loaded->Decode(std::span<const int>(&alias, 1));
+  Require("alias bytes", alias_actual == alias_expected,
+          std::to_string(alias_actual.size()) + " vs " +
+              std::to_string(alias_expected.size()));
+
+  std::printf("Stage 1 tokenizer: short %zu, full %zu, alias %zu bytes\n",
+              short_actual.size(), full_actual.size(), alias_actual.size());
+  return 0;
+}
+
+int RunLogitCheck() {
+  const auto dir = MakeDirectory();
+  if (dir.empty()) {
+    return 1;
+  }
+  DirectoryGuard guard{dir};
+  const auto path = dir / "synthetic._hy4top_";
+  constexpr int n_ctx = 4;
+  constexpr int k = 2;
+  constexpr int rows = 1;
+  const std::int32_t tokens[n_ctx] = {1, 2, 3, 4};
+  const std::uint8_t mask[n_ctx - 1] = {0, 1, 1};
+  const float reference_log_probs[n_ctx * k] = {
+      0.0F, 0.0F, 0.0F, 0.0F, std::log(0.5F), std::log(0.25F), 0.0F, 0.0F};
+  const std::int32_t reference_ids[n_ctx * k] = {0, 0, 0, 0, 1, 2, 0, 0};
+  {
+    std::ofstream out(path, std::ios::binary);
+    out.write("_hy4top_", 8);
+    const std::int32_t header[3] = {n_ctx, k, rows};
+    out.write(reinterpret_cast<const char*>(header), sizeof header);
+    out.write(reinterpret_cast<const char*>(tokens), sizeof tokens);
+    out.write(reinterpret_cast<const char*>(mask), sizeof mask);
+    out.write(reinterpret_cast<const char*>(reference_log_probs),
+              sizeof reference_log_probs);
+    out.write(reinterpret_cast<const char*>(reference_ids),
+              sizeof reference_ids);
+    Require("synthetic reference write", static_cast<bool>(out));
+  }
+
+  using gufo::models::hy4_flash::KldPosition;
+  using gufo::models::hy4_flash::LoadTopkReference;
+  using gufo::models::hy4_flash::ScorePosition;
+  using gufo::models::hy4_flash::TopkReference;
+  using gufo::models::hy4_flash::WriteKldPosition;
+  TopkReference reference;
+  std::string error;
+  Require("reference load", LoadTopkReference(path, 2, &reference, &error),
+          error);
+  Require("reference shape", reference.n_ctx == n_ctx && reference.k == k &&
+                                 reference.rows == rows);
+
+  TopkReference wrong_k;
+  Require("wrong expected k", !LoadTopkReference(path, 64, &wrong_k, &error),
+          error);
+
+  const auto truncated = dir / "truncated._hy4top_";
+  {
+    std::ifstream input(path, std::ios::binary);
+    std::ofstream output(truncated, std::ios::binary);
+    char header[20];
+    input.read(header, sizeof header);
+    output.write(header, sizeof header);
+    Require("truncated reference write", static_cast<bool>(output));
+  }
+  TopkReference short_reference;
+  Require("truncated reference",
+          !LoadTopkReference(truncated, 2, &short_reference, &error), error);
+
+  const float same_logits[4] = {std::log(0.125F), std::log(0.5F),
+                                std::log(0.25F), std::log(0.125F)};
+  KldPosition same;
+  Require("self score",
+          ScorePosition(same_logits, 4,
+                        reference.reference_log_probs.data() + 2 * k,
+                        reference.ids.data() + 2 * k, k, &same, &error),
+          error);
+  Require("self KL", std::abs(same.kl) < 1e-12);
+
+  const float other_logits[4] = {0.0F, 3.0F, 1.0F, 0.0F};
+  KldPosition other;
+  Require("other score",
+          ScorePosition(other_logits, 4,
+                        reference.reference_log_probs.data() + 2 * k,
+                        reference.ids.data() + 2 * k, k, &other, &error),
+          error);
+  Require("known KL", std::abs(other.kl - 0.247990059) < 1e-6);
+  Require("gufo log prob count", other.gufo_log_probs.size() == 2);
+  Require("reference tail", std::abs(other.reference_tail - 0.25) < 1e-6);
+
+  const float wrong_order_log_probs[2] = {-1.000004F, -1.0F};
+  const std::int32_t ordered_ids[2] = {1, 2};
+  KldPosition wrong_order;
+  Require("wrong reference order rejected",
+          !ScorePosition(other_logits, 4, wrong_order_log_probs, ordered_ids, 2,
+                         &wrong_order, &error),
+          error);
+
+  const float positive_log_probs[2] = {0.000001F, -30.0F};
+  KldPosition positive;
+  Require("positive reference log-probability rejected",
+          !ScorePosition(other_logits, 4, positive_log_probs, ordered_ids, 2,
+                         &positive, &error),
+          error);
+
+  const float uniform_logits[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+  const float offset_logits[4] = {1e20F, 1e20F, 1e20F, 1e20F};
+  KldPosition uniform;
+  KldPosition offset;
+  Require("uniform score",
+          ScorePosition(uniform_logits, 4,
+                        reference.reference_log_probs.data() + 2 * k,
+                        reference.ids.data() + 2 * k, k, &uniform, &error),
+          error);
+  Require("offset score",
+          ScorePosition(offset_logits, 4,
+                        reference.reference_log_probs.data() + 2 * k,
+                        reference.ids.data() + 2 * k, k, &offset, &error),
+          error);
+  Require("offset KL", std::abs(uniform.kl - offset.kl) < 1e-6);
+
+  const float duplicate_log_probs[2] = {std::log(0.5F), std::log(0.25F)};
+  const std::int32_t duplicate_ids[2] = {1, 1};
+  KldPosition duplicate;
+  Require("duplicate ID rejected",
+          !ScorePosition(other_logits, 4, duplicate_log_probs, duplicate_ids, 2,
+                         &duplicate, &error),
+          error);
+
+  const float heavy_log_probs[2] = {std::log(0.75F), std::log(0.75F)};
+  const std::int32_t heavy_ids[2] = {1, 2};
+  KldPosition heavy;
+  Require("mass above one rejected",
+          !ScorePosition(other_logits, 4, heavy_log_probs, heavy_ids, 2, &heavy,
+                         &error),
+          error);
+
+  const float infinite_logits[4] = {0.0F, INFINITY, 1.0F, 0.0F};
+  KldPosition infinite;
+  Require("non-finite logits rejected",
+          !ScorePosition(infinite_logits, 4,
+                         reference.reference_log_probs.data() + 2 * k,
+                         reference.ids.data() + 2 * k, 2, &infinite, &error),
+          error);
+
+  std::ostringstream line;
+  WriteKldPosition(line, 0, 2, other);
+  Require("written line", line.str().rfind("0 2 ", 0) == 0);
+  std::printf("Logit check: self KL 0, known KL %.9g\n", other.kl);
+  return 0;
+}
+
+#ifdef HY4_IMAGE_CHECKS
+int RunPrepareImage(int argc, char** argv) {
+  std::filesystem::path image;
+  std::filesystem::path rgb;
+  std::filesystem::path size;
+  for (int i = 2; i < argc; ++i) {
+    const std::string option = argv[i];
+    const auto value = [&]() -> std::string {
+      if (++i >= argc) {
+        throw CheckFailure{};
+      }
+      return argv[i];
+    };
+    if (option == "--image") {
+      image = value();
+    } else if (option == "--rgb") {
+      rgb = value();
+    } else if (option == "--size") {
+      size = value();
+    } else {
+      std::fprintf(stderr, "unknown argument: %s\n", option.c_str());
+      return 2;
+    }
+  }
+  Require("image path", std::filesystem::is_regular_file(image),
+          image.string());
+  Require("rgb path", !rgb.empty());
+  Require("size path", !size.empty());
+
+  const gufo::models::hy4_flash::VisionGeometry geometry;
+  std::string error;
+  const auto bytes = gufo::core::ReadImageFile(image);
+  gufo::core::Image prepared;
+  const bool prepared_ok =
+      gufo::models::hy4_flash::PrepareImage(bytes, geometry, &prepared, &error);
+  Require("image prepare", prepared_ok, error);
+
+  std::ofstream rgb_file(rgb, std::ios::binary);
+  rgb_file.write(reinterpret_cast<const char*>(prepared.pixels.data()),
+                 static_cast<std::streamsize>(prepared.pixels.size()));
+  rgb_file.close();
+  Require("rgb write", static_cast<bool>(rgb_file), rgb.string());
+
+  std::ofstream size_file(size);
+  size_file << prepared.width << "x" << prepared.height;
+  size_file.close();
+  Require("size write", static_cast<bool>(size_file), size.string());
+
+  const int rows = gufo::models::hy4_flash::VisionRows(
+      static_cast<int>(prepared.width), static_cast<int>(prepared.height),
+      geometry);
+  std::printf("%ux%u %d\n", prepared.width, prepared.height, rows);
+  return 0;
+}
+
+int RunResizeOnly(int argc, char** argv) {
+  int width = 0;
+  int height = 0;
+  for (int i = 2; i < argc; ++i) {
+    const std::string option = argv[i];
+    const auto value = [&]() -> std::string {
+      if (++i >= argc) {
+        throw CheckFailure{};
+      }
+      return argv[i];
+    };
+    if (option == "--width") {
+      width = std::stoi(value());
+    } else if (option == "--height") {
+      height = std::stoi(value());
+    } else {
+      std::fprintf(stderr, "unknown argument: %s\n", option.c_str());
+      return 2;
+    }
+  }
+  Require("width", width > 0);
+  Require("height", height > 0);
+
+  const gufo::models::hy4_flash::VisionGeometry geometry;
+  int target_width = 0;
+  int target_height = 0;
+  std::string error;
+  const bool resized = gufo::models::hy4_flash::SmartResize(
+      width, height, geometry, &target_width, &target_height, &error);
+  Require("resize", resized, error);
+  std::printf("%dx%d\n", target_width, target_height);
+  return 0;
+}
+#endif
+
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc > 1 && std::string_view(argv[1]) == "--stage1-tokenizer") {
+    try {
+      return RunStage1Tokenizer(argc, argv);
+    } catch (const CheckFailure&) {
+      return 1;
+    } catch (const std::exception& exception) {
+      std::fprintf(stderr, "FAIL %s\n", exception.what());
+      return 1;
+    }
+  }
+
+  if (argc > 1 && std::string_view(argv[1]) == "--logit-check") {
+    try {
+      return RunLogitCheck();
+    } catch (const CheckFailure&) {
+      return 1;
+    } catch (const std::exception& exception) {
+      std::fprintf(stderr, "FAIL %s\n", exception.what());
+      return 1;
+    }
+  }
+
+#ifdef HY4_IMAGE_CHECKS
+  if (argc > 1 && std::string_view(argv[1]) == "--prepare-image") {
+    try {
+      return RunPrepareImage(argc, argv);
+    } catch (const CheckFailure&) {
+      return 1;
+    } catch (const std::exception& exception) {
+      std::fprintf(stderr, "FAIL %s\n", exception.what());
+      return 1;
+    }
+  }
+  if (argc > 1 && std::string_view(argv[1]) == "--resize-only") {
+    try {
+      return RunResizeOnly(argc, argv);
+    } catch (const CheckFailure&) {
+      return 1;
+    } catch (const std::exception& exception) {
+      std::fprintf(stderr, "FAIL %s\n", exception.what());
+      return 1;
+    }
+  }
+#endif
+
   using gufo::models::hy4_flash::ProbeHy4Flash;
   using gufo::models::hy4_flash::ProbeHy4FlashGguf;
   using gufo::models::hy4_flash::VerifyHy4FlashModel;

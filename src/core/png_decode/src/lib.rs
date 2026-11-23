@@ -96,6 +96,34 @@ pub unsafe extern "C" fn gufo_png_decode_rgb8(
 }
 
 /// # Safety
+/// `decoder` comes from `gufo_png_open` and is not closed. `rgba` points to
+/// `rgba_len` writable bytes, or `rgba_len` is 0, and does not overlap the PNG
+/// bytes.
+#[allow(unsafe_code)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gufo_png_decode_rgba8(
+    decoder: *mut GufoPngDecoder,
+    rgba: *mut u8,
+    rgba_len: usize,
+) -> GufoPngStatus {
+    guard(GufoPngStatus::Internal, || {
+        // SAFETY: the caller upholds the contract above; `as_mut` rejects null.
+        let Some(decoder) = (unsafe { decoder.as_mut() }) else {
+            return GufoPngStatus::Internal;
+        };
+        // A decoder decodes once.
+        let Some(png) = decoder.png.take() else {
+            return GufoPngStatus::Internal;
+        };
+        // SAFETY: the caller supplies an exclusive writable output buffer.
+        let Some(rgba) = (unsafe { gufo_ffi::output(rgba, rgba_len) }) else {
+            return GufoPngStatus::Internal;
+        };
+        status(png.decode_rgba8(rgba))
+    })
+}
+
+/// # Safety
 /// `decoder` is null or comes from `gufo_png_open` and is not yet closed.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]

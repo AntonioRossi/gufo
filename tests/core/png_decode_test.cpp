@@ -349,6 +349,31 @@ void Formats() {
   }
 }
 
+void WhiteComposite() {
+  const Bytes rows{10, 20, 30, 0, 40, 50, 60, 128};
+  const auto png =
+      WritePng({PNG_COLOR_TYPE_RGB_ALPHA, 8}, 2, 1, rows, false, false);
+  const auto plain = gufo::core::DecodeImage(png);
+  Require(plain.pixels == Bytes{10, 20, 30, 40, 50, 60});
+  const auto white =
+      gufo::core::DecodeImage(png, {.composite_over_white = true});
+  Require(white.pixels == Bytes{255, 255, 255, 147, 152, 157});
+
+  const Bytes rgb_rows{10, 20, 30, 10, 20, 30};
+  const auto rgb_png =
+      WritePng({PNG_COLOR_TYPE_RGB, 8}, 2, 1, rgb_rows, false, true);
+  const auto rgb_keyed =
+      gufo::core::DecodeImage(rgb_png, {.composite_over_white = true});
+  Require(rgb_keyed.pixels == rgb_rows);
+
+  const Bytes gray_rows{50, 50};
+  const auto gray_png =
+      WritePng({PNG_COLOR_TYPE_GRAY, 8}, 2, 1, gray_rows, false, true);
+  const auto gray_keyed =
+      gufo::core::DecodeImage(gray_png, {.composite_over_white = true});
+  Require(gray_keyed.pixels == Bytes{50, 50, 50, 50, 50, 50});
+}
+
 void Framing() {
   const auto check = [](std::string_view name, const Bytes& png,
                         bool accepted) {
@@ -437,6 +462,7 @@ void Orientation() {
 int main() {
   try {
     Formats();
+    WhiteComposite();
     Framing();
     Orientation();
   } catch (const std::exception& error) {

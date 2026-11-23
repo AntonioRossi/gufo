@@ -7,8 +7,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <limits>
-#include <numbers>
 #include <utility>
 
 namespace gufo::minimax_h3::image_processor {
@@ -18,104 +16,6 @@ void SetError(std::string* error, std::string message) {
   if (error != nullptr) {
     *error = std::move(message);
   }
-}
-
-// ---------------------------------------------------------------------------
-// Pillow-parity Lanczos resampler.
-//
-// Copied from src/models/qwen_image_21/image.cpp (LanczosFilters, lines
-// 45-73, and the resample body of ResizeImage, lines 179-237, in the same
-// repository). That implementation is itself a reproduction of Pillow's
-// ImagingResample.c: 22-bit fixed-point integer Lanczos-3 coefficients with
-// per-pass rounding back to uint8. The original handles RGBA with
-// premultiplication; keyframe inputs here are core::Image RGB8 (opaque),
-// where Pillow's premultiply/unpremultiply round-trip is the identity, so
-// only the three RGB channels are carried and the alpha passes are dropped.
-// Everything numerically load-bearing — filter support, centers, weights,
-// the 1 << 21 bias, and the >> 22 shift with clamping — is byte-for-byte
-// the reference behavior.
-// ---------------------------------------------------------------------------
-
-struct Filter {
-  int begin{0};
-  std::vector<std::int32_t> weights;
-};
-
-std::vector<Filter> LanczosFilters(int input, int output) {
-  std::vector<Filter> result(output);
-  const double scale = static_cast<double>(input) / output;
-  const double filter_scale = std::max(scale, 1.0);
-  const double support = filter_scale * 3;
-  for (int dst = 0; dst < output; ++dst) {
-    const double center = (dst + 0.5) * scale;
-    const int start = std::max(0, static_cast<int>(center - support + 0.5));
-    const int end = std::min(input, static_cast<int>(center + support + 0.5));
-    auto& f = result[dst];
-    f.begin = start;
-    std::vector<double> values;
-    double sum = 0;
-    for (int i = start; i < end; ++i) {
-      const double x = (i - center + 0.5) / filter_scale;
-      const auto sinc = [](double z) {
-        return z == 0 ? 1.0
-                      : std::sin(z * std::numbers::pi) / (z * std::numbers::pi);
-      };
-      const double w = (x >= -3 && x < 3) ? sinc(x) * sinc(x / 3) : 0;
-      values.push_back(w);
-      sum += w;
-    }
-    for (double value : values) {
-      f.weights.push_back(static_cast<std::int32_t>(value / sum * (1 << 22) +
-                                                    (value < 0 ? -0.5 : 0.5)));
-    }
-  }
-  return result;
-}
-
-// Two-pass Lanczos resize of packed RGB8. Each pass rounds to uint8,
-// matching Pillow exactly (including intermediate clipping).
-bool ResizeRgb8(const std::vector<std::uint8_t>& source, int source_width,
-                int source_height, int width, int height,
-                std::vector<std::uint8_t>* output) {
-  const auto horizontal = LanczosFilters(source_width, width);
-  const auto vertical = LanczosFilters(source_height, height);
-  std::vector<std::uint8_t> temp(static_cast<std::size_t>(width) *
-                                 source_height * 3);
-  for (int y = 0; y < source_height; ++y) {
-    for (int x = 0; x < width; ++x) {
-      for (int c = 0; c < 3; ++c) {
-        std::int64_t sum = 1 << 21;
-        const auto& f = horizontal[x];
-        for (std::size_t k = 0; k < f.weights.size(); ++k) {
-          sum += static_cast<std::int64_t>(f.weights[k]) *
-                 source[(static_cast<std::size_t>(y) * source_width + f.begin +
-                         k) *
-                            3 +
-                        c];
-        }
-        temp[(static_cast<std::size_t>(y) * width + x) * 3 + c] =
-            static_cast<std::uint8_t>(
-                std::clamp<std::int64_t>(sum >> 22, 0, 255));
-      }
-    }
-  }
-  output->resize(static_cast<std::size_t>(width) * height * 3);
-  for (int y = 0; y < height; ++y) {
-    for (int x = 0; x < width; ++x) {
-      for (int c = 0; c < 3; ++c) {
-        std::int64_t sum = 1 << 21;
-        const auto& f = vertical[y];
-        for (std::size_t k = 0; k < f.weights.size(); ++k) {
-          sum += static_cast<std::int64_t>(f.weights[k]) *
-                 temp[((f.begin + k) * width + x) * 3 + c];
-        }
-        (*output)[(static_cast<std::size_t>(y) * width + x) * 3 + c] =
-            static_cast<std::uint8_t>(
-                std::clamp<std::int64_t>(sum >> 22, 0, 255));
-      }
-    }
-  }
-  return true;
 }
 
 // Python round(): round-half-to-even on the binary double value.
@@ -162,8 +62,8 @@ bool PrepareKeyframe(const core::Image& image, int canvas_width,
     return true;
   }
   if (fit == KeyframeFit::kStretch) {
-    return ResizeRgb8(image.pixels, width, height, canvas_width, canvas_height,
-                      rgb)
+    return core::ResizeRgb8(image.pixels, width, height, canvas_width,
+                            canvas_height, rgb)
                ? true
                : (SetError(error, "MiniMax H3 keyframe stretch failed"), false);
   }
@@ -179,8 +79,8 @@ bool PrepareKeyframe(const core::Image& image, int canvas_width,
   std::vector<std::uint8_t> scaled;
   if (resized_width == width && resized_height == height) {
     scaled = image.pixels;
-  } else if (!ResizeRgb8(image.pixels, width, height, resized_width,
-                         resized_height, &scaled)) {
+  } else if (!core::ResizeRgb8(image.pixels, width, height, resized_width,
+                               resized_height, &scaled)) {
     SetError(error, "MiniMax H3 keyframe cover resize failed");
     return false;
   }

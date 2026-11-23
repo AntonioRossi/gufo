@@ -20,6 +20,36 @@
         "type": "github"
       }
     },
+    "hy4-ggml": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1789891691,
+        "narHash": "sha256-SRGoXa+4ACBCB3eaG9XFYhMN1i0FyPEy9Rrer+dFGYI=",
+        "rev": "3cf03257f219afbe7334045ff7c6a06ac68c627d",
+        "revCount": 11062,
+        "type": "git",
+        "url": "https://github.com/ggml-org/llama.cpp.git"
+      },
+      "original": {
+        "type": "git",
+        "url": "https://github.com/ggml-org/llama.cpp.git"
+      }
+    },
+    "hy4-maya": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1795349889,
+        "narHash": "sha256-fqiMxb9QT98IQG1TF6HjFxiOSvFRExdsqSAF/jM34aI=",
+        "rev": "e8d4f297f434091082e4d297ea78dea0c7be3f57",
+        "revCount": 1637,
+        "type": "git",
+        "url": "https://github.com/mw00/project-maya.git"
+      },
+      "original": {
+        "type": "git",
+        "url": "https://github.com/mw00/project-maya.git"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1792773339,
@@ -55,6 +85,8 @@
     "root": {
       "inputs": {
         "audio-cpp": "audio-cpp",
+        "hy4-ggml": "hy4-ggml",
+        "hy4-maya": "hy4-maya",
         "nixpkgs": "nixpkgs",
         "nixpkgs-rocm10": "nixpkgs-rocm10",
         "rust-overlay": "rust-overlay"

@@ -3,6 +3,7 @@
   newScope,
   releaseVersion ? null,
   revision,
+  hy4Sources,
   rocmPackages,
   rustToolchain,
 }:
@@ -13,7 +14,7 @@ lib.makeScope newScope (self: {
   # mlir-aie (IRON) and Peano for NPU designs (src/core/npu/kernels).
   iron = self.callPackage ./iron { };
   gufo = self.callPackage ./package.nix {
-    inherit releaseVersion revision rocmPackages rustToolchain;
+    inherit hy4Sources releaseVersion revision rocmPackages rustToolchain;
     xrt = self.xrt-amdxdna;
     inherit (self) iron;
   };

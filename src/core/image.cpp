@@ -7,13 +7,16 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <csetjmp>
 #include <cstring>
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <numbers>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #include "src/core/base64.hpp"
 #include "src/core/platform/socket.hpp"
@@ -27,6 +30,43 @@ void ValidateDimensions(std::uint32_t width, std::uint32_t height) {
     throw std::invalid_argument(
         "image dimensions exceed the decoded pixel limit");
   }
+}
+
+struct Filter {
+  int begin{0};
+  std::vector<std::int32_t> weights;
+};
+
+// Pillow's ImagingResample.c: Lanczos-3, 22-bit fixed-point coefficients.
+std::vector<Filter> LanczosFilters(int input, int output) {
+  std::vector<Filter> result(output);
+  const double scale = static_cast<double>(input) / output;
+  const double filter_scale = std::max(scale, 1.0);
+  const double support = filter_scale * 3;
+  for (int dst = 0; dst < output; ++dst) {
+    const double center = (dst + 0.5) * scale;
+    const int start = std::max(0, static_cast<int>(center - support + 0.5));
+    const int end = std::min(input, static_cast<int>(center + support + 0.5));
+    auto& f = result[dst];
+    f.begin = start;
+    std::vector<double> values;
+    double sum = 0;
+    for (int i = start; i < end; ++i) {
+      const double x = (i - center + 0.5) / filter_scale;
+      const auto sinc = [](double z) {
+        return z == 0 ? 1.0
+                      : std::sin(z * std::numbers::pi) / (z * std::numbers::pi);
+      };
+      const double w = (x >= -3 && x < 3) ? sinc(x) * sinc(x / 3) : 0;
+      values.push_back(w);
+      sum += w;
+    }
+    for (double value : values) {
+      f.weights.push_back(static_cast<std::int32_t>(value / sum * (1 << 22) +
+                                                    (value < 0 ? -0.5 : 0.5)));
+    }
+  }
+  return result;
 }
 
 struct JpegError {
@@ -123,6 +163,45 @@ Image DecodePng(std::span<const std::uint8_t> bytes) {
   image.pixels.resize(std::size_t{image.width} * image.height * 3);
   CheckPng(gufo_png_decode_rgb8(decoder.get(), image.pixels.data(),
                                 image.pixels.size()));
+  return image;
+}
+
+struct RgbaImage {
+  std::uint32_t width{0};
+  std::uint32_t height{0};
+  std::vector<std::uint8_t> pixels;
+};
+
+RgbaImage DecodePngRgba(std::span<const std::uint8_t> bytes) {
+  GufoPngDecoder* opened = nullptr;
+  GufoPngDimensions size{};
+  const GufoPngStatus status =
+      gufo_png_open(bytes.data(), bytes.size(), &opened, &size);
+  const std::unique_ptr<GufoPngDecoder, PngDecoderClose> decoder(opened);
+  CheckPng(status);
+  ValidateDimensions(size.width, size.height);
+  RgbaImage image{size.width, size.height, {}};
+  image.pixels.resize(std::size_t{image.width} * image.height * 4);
+  CheckPng(gufo_png_decode_rgba8(decoder.get(), image.pixels.data(),
+                                 image.pixels.size()));
+  return image;
+}
+
+// Pillow's paste over an opaque white background: (rgb*a + 255*(255-a) + 127)
+// / 255 for each channel. Orientation only moves pixels, so blending first
+// gives the same bytes as rotating RGBA first and saves a rotated RGBA buffer.
+Image CompositeOverWhite(const RgbaImage& rgba) {
+  Image image{rgba.width, rgba.height, {}};
+  image.pixels.resize(std::size_t{image.width} * image.height * 3);
+  for (std::size_t i = 0; i < std::size_t{image.width} * image.height; ++i) {
+    const unsigned alpha = rgba.pixels[i * 4 + 3];
+    const unsigned inverse = 255 - alpha;
+    for (int channel = 0; channel < 3; ++channel) {
+      const unsigned value = rgba.pixels[i * 4 + channel];
+      image.pixels[i * 3 + channel] = static_cast<std::uint8_t>(
+          (value * alpha + 255 * inverse + 127) / 255);
+    }
+  }
   return image;
 }
 
@@ -256,6 +335,28 @@ Image Orient(Image image, unsigned orientation) {
   return result;
 }
 
+// WebP EXIF is a RIFF chunk. Some writers keep the JPEG-style Exif\0\0 prefix;
+// others store the TIFF header directly. Strip the prefix only when present.
+unsigned WebpOrientation(std::span<const std::uint8_t> bytes) {
+  std::size_t offset = 12;
+  while (offset + 8 <= bytes.size()) {
+    const std::uint32_t size = std::uint32_t{bytes[offset + 4]} |
+                               (std::uint32_t{bytes[offset + 5]} << 8) |
+                               (std::uint32_t{bytes[offset + 6]} << 16) |
+                               (std::uint32_t{bytes[offset + 7]} << 24);
+    if (size > bytes.size() - offset - 8)
+      break;
+    if (std::memcmp(bytes.data() + offset, "EXIF", 4) == 0) {
+      auto chunk = bytes.subspan(offset + 8, size);
+      if (chunk.size() >= 6 && std::memcmp(chunk.data(), "Exif\0\0", 6) == 0)
+        chunk = chunk.subspan(6);
+      return TiffOrientation(chunk);
+    }
+    offset += 8 + static_cast<std::size_t>(size) + (size & 1U);
+  }
+  return 1;
+}
+
 std::vector<std::uint8_t> DecodeBase64(std::string_view input) {
   if (input.empty() || input.size() % 4 != 0 ||
       input.size() > ((kMaxEncodedImageBytes + 2) / 3) * 4) {
@@ -299,9 +400,95 @@ Image DecodeWebp(std::span<const std::uint8_t> bytes) {
   return image;
 }
 
+RgbaImage DecodeWebpRgba(std::span<const std::uint8_t> bytes) {
+  int width = 0;
+  int height = 0;
+  if (WebPGetInfo(bytes.data(), bytes.size(), &width, &height) == 0)
+    throw std::invalid_argument("invalid WebP image");
+  ValidateDimensions(static_cast<std::uint32_t>(width),
+                     static_cast<std::uint32_t>(height));
+  RgbaImage image{static_cast<std::uint32_t>(width),
+                  static_cast<std::uint32_t>(height),
+                  {}};
+  image.pixels.resize(std::size_t{image.width} * image.height * 4);
+  if (WebPDecodeRGBAInto(bytes.data(), bytes.size(), image.pixels.data(),
+                         image.pixels.size(),
+                         static_cast<int>(image.width) * 4) == nullptr)
+    throw std::invalid_argument("invalid WebP image");
+  return image;
+}
+
+// PNG colour types 3, 4 and 6 carry alpha, or a palette that expands to alpha.
+// Types 0 and 2 keep their gray or RGB colour-key values.
+bool PngCompositesOverWhite(std::span<const std::uint8_t> bytes) {
+  if (bytes.size() < 26)
+    return false;
+  const std::uint8_t color_type = bytes[25];
+  return color_type == 3 || color_type == 4 || color_type == 6;
+}
+
 }  // namespace
 
+bool ResizeRgb8(const std::vector<std::uint8_t>& source, int source_width,
+                int source_height, int width, int height,
+                std::vector<std::uint8_t>* output) {
+  if (output == nullptr || source_width <= 0 || source_height <= 0 ||
+      width <= 0 || height <= 0 ||
+      source.size() != static_cast<std::size_t>(source_width) *
+                           static_cast<std::size_t>(source_height) * 3) {
+    return false;
+  }
+  if (width == source_width && height == source_height) {
+    *output = source;
+    return true;
+  }
+  const auto horizontal = LanczosFilters(source_width, width);
+  const auto vertical = LanczosFilters(source_height, height);
+  std::vector<std::uint8_t> temp(static_cast<std::size_t>(width) *
+                                 source_height * 3);
+  for (int y = 0; y < source_height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      for (int c = 0; c < 3; ++c) {
+        std::int64_t sum = 1 << 21;
+        const auto& f = horizontal[x];
+        for (std::size_t k = 0; k < f.weights.size(); ++k) {
+          sum += static_cast<std::int64_t>(f.weights[k]) *
+                 source[(static_cast<std::size_t>(y) * source_width + f.begin +
+                         k) *
+                            3 +
+                        c];
+        }
+        temp[(static_cast<std::size_t>(y) * width + x) * 3 + c] =
+            static_cast<std::uint8_t>(
+                std::clamp<std::int64_t>(sum >> 22, 0, 255));
+      }
+    }
+  }
+  output->resize(static_cast<std::size_t>(width) * height * 3);
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      for (int c = 0; c < 3; ++c) {
+        std::int64_t sum = 1 << 21;
+        const auto& f = vertical[y];
+        for (std::size_t k = 0; k < f.weights.size(); ++k) {
+          sum += static_cast<std::int64_t>(f.weights[k]) *
+                 temp[((f.begin + k) * width + x) * 3 + c];
+        }
+        (*output)[(static_cast<std::size_t>(y) * width + x) * 3 + c] =
+            static_cast<std::uint8_t>(
+                std::clamp<std::int64_t>(sum >> 22, 0, 255));
+      }
+    }
+  }
+  return true;
+}
+
 Image DecodeImage(std::span<const std::uint8_t> bytes) {
+  return DecodeImage(bytes, {});
+}
+
+Image DecodeImage(std::span<const std::uint8_t> bytes,
+                  const ImageDecodeOptions& options) {
   if (bytes.empty() || bytes.size() > kMaxEncodedImageBytes) {
     throw std::invalid_argument("image exceeds encoded byte limit or is empty");
   }
@@ -310,6 +497,10 @@ Image DecodeImage(std::span<const std::uint8_t> bytes) {
   if (bytes.size() >= kPngSignature.size() &&
       std::memcmp(bytes.data(), kPngSignature.data(), kPngSignature.size()) ==
           0) {
+    if (options.composite_over_white && PngCompositesOverWhite(bytes)) {
+      return Orient(CompositeOverWhite(DecodePngRgba(bytes)),
+                    PngOrientation(bytes));
+    }
     return Orient(DecodePng(bytes), PngOrientation(bytes));
   }
   if (bytes.size() >= 2 && bytes[0] == 0xff && bytes[1] == 0xd8) {
@@ -317,7 +508,15 @@ Image DecodeImage(std::span<const std::uint8_t> bytes) {
   }
   if (bytes.size() >= 12 && std::memcmp(bytes.data(), "RIFF", 4) == 0 &&
       std::memcmp(bytes.data() + 8, "WEBP", 4) == 0) {
-    return DecodeWebp(bytes);
+    if (options.composite_over_white) {
+      const unsigned orientation =
+          options.apply_webp_exif ? WebpOrientation(bytes) : 1;
+      return Orient(CompositeOverWhite(DecodeWebpRgba(bytes)), orientation);
+    }
+    Image image = DecodeWebp(bytes);
+    if (options.apply_webp_exif)
+      return Orient(std::move(image), WebpOrientation(bytes));
+    return image;
   }
   throw std::invalid_argument("image must be PNG, JPEG or WebP");
 }

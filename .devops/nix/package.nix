@@ -30,6 +30,7 @@
   releaseVersion ? null,
   extensionsFromLock ? false,
   extensions ? [ ],
+  hy4Sources ? { },
   revision,
   sourceRoot ? ../..,
 }:
@@ -77,6 +78,9 @@ let
   # Revisions before model extensions have no extensions.lock, keep the eval
   # fixture under the DeepSeek tests and report no extension selection.
   hasExtensions = builtins.pathExists (sourceRoot + "/extensions.lock");
+  extensionMetadata = import ./extension-metadata.nix {
+    inherit lib sourceRoot extensions extensionsFromLock;
+  };
   # Revisions before extension modules have no SDK to install.
   hasExtensionSdk = builtins.pathExists (sourceRoot + "/cmake/GufoExtensionSdk.cmake");
   # The NPU designs build as a derivation of their own from this sourceRoot
@@ -187,6 +191,8 @@ stdenv.mkDerivation {
     "-DGUFO_FFPROBE_EXECUTABLE=${ffmpeg-headless}/bin/ffprobe"
     "-DCMAKE_HIP_COMPILER=${rocmPackages.llvm.clang}/bin/clang"
   ] ++ lib.optional (xrt != null) "-DXRT_DIR=${xrt}/opt/xilinx/xrt/share/cmake/XRT"
+  ++ lib.optionals (hasExtensions && builtins.elem "hy4_flash" extensionMetadata.extensions)
+    (lib.mapAttrsToList (name: value: "-D${name}=${value}") hy4Sources)
   ++ lib.optional (npuDesigns != null) "-DGUFO_NPU_PREBUILT_DESIGNS=${npuDesigns}/share/gufo/npu"
   ++ lib.optional (iron != null && npuDesigns == null) "-DGUFO_IRON_PYTHON=${iron}/bin/python3"
   ++ lib.optional hasExtensionSdk "-DGUFO_SDK_INSTALL_DIR=${placeholder "sdk"}/lib/gufo/sdk"
@@ -276,9 +282,7 @@ stdenv.mkDerivation {
 
   passthru = {
     inherit releaseVersion revision rocmPackages rocmRuntime extensionsFromLock xrt iron npuDesigns;
-    extensionMetadata = import ./extension-metadata.nix {
-      inherit lib sourceRoot extensions extensionsFromLock;
-    };
+    inherit extensionMetadata;
     toolchain = {
       targetPlatform = "x86_64-linux";
       targetGpu = "gfx1151";

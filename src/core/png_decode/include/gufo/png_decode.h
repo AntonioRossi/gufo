@@ -39,6 +39,13 @@ GufoPngStatus gufo_png_open(const uint8_t* bytes, size_t len,
 GufoPngStatus gufo_png_decode_rgb8(GufoPngDecoder* decoder, uint8_t* rgb,
                                    size_t rgb_len);
 
+/* Decodes the opened image into packed RGBA8: the same rules as
+   gufo_png_decode_rgb8, plus an alpha channel (255 for opaque formats).
+   rgba_len must be 4 * width * height, and rgba must not overlap the PNG
+   bytes. A decoder decodes once; a second call returns GUFO_PNG_INTERNAL. */
+GufoPngStatus gufo_png_decode_rgba8(GufoPngDecoder* decoder, uint8_t* rgba,
+                                    size_t rgba_len);
+
 /* Releases a decoder from gufo_png_open. A null decoder is ignored. */
 void gufo_png_close(GufoPngDecoder* decoder);
 
