@@ -159,6 +159,13 @@ static int RunHy4Prompt(const ext::TextPromptOptions& options,
     }
     const int vocab = model.vocab();
     const int first = reference.n_ctx / 2;
+    for (int i = 0; i < reference.n_ctx - 1; ++i) {
+      const std::uint8_t value = reference.mask[static_cast<std::size_t>(i)];
+      if (value > 1 || (i < first && value != 0)) {
+        std::cerr << "hy4: invalid mask byte at position " << i << "\n";
+        return 1;
+      }
+    }
     std::vector<float> logits(static_cast<std::size_t>(hy4::k::kMaxWin) *
                               static_cast<std::size_t>(vocab));
     const bool write_output = kld_out != nullptr && *kld_out != '\0';

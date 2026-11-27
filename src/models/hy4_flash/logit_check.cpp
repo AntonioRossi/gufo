@@ -57,17 +57,19 @@ bool LoadTopkReference(const std::filesystem::path& path, int expected_k,
     SetError(error, "expected k must be positive");
     return false;
   }
-  std::error_code file_error;
-  const std::uintmax_t file_size = std::filesystem::file_size(path, file_error);
-  if (file_error) {
-    SetError(error, path.string() + ": cannot stat");
-    return false;
-  }
   std::ifstream input(path, std::ios::binary);
   if (!input) {
     SetError(error, path.string() + ": cannot open");
     return false;
   }
+  input.seekg(0, std::ios::end);
+  const std::streamoff size = input.tellg();
+  input.seekg(0, std::ios::beg);
+  if (size < 0) {
+    SetError(error, path.string() + ": cannot get the file size");
+    return false;
+  }
+  const std::uintmax_t file_size = static_cast<std::uintmax_t>(size);
   char magic[8];
   std::int32_t header[3] = {0, 0, 0};
   if (!ReadExact(&input, magic, sizeof magic) ||
@@ -79,7 +81,7 @@ bool LoadTopkReference(const std::filesystem::path& path, int expected_k,
   const int n_ctx = header[0];
   const int k = header[1];
   const int rows = header[2];
-  if (n_ctx < 2 || rows <= 0 || k != expected_k) {
+  if (n_ctx < 3 || rows != 1 || k != expected_k) {
     SetError(error, path.string() + ": invalid reference geometry");
     return false;
   }
