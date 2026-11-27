@@ -23,10 +23,13 @@
 
 #include <algorithm>
 #include <array>
+#include <fstream>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "../kernels/rocm/resident_api.h"
@@ -37,6 +40,7 @@
 #include "v41_dspark.h"
 #include <gufo/ext/crypto.hpp>
 #include <gufo/ext/host.hpp>
+#include <gufo/ext/host_budget.hpp>
 #include <gufo/ext/mapped_prefetch.hpp>
 
 DS41_NAMESPACE_BEGIN
@@ -1837,24 +1841,99 @@ static void ds41_acquire_instance_lock(void) {
   g_ds41_lock_fd = fd;
 }
 
-/* Primes the streamed expert cache from the model's histogram file when one
- * sits beside it, otherwise from the built-in ranking. */
-static void seed_experts(ds41_engine* e) {
+/* The checked-in rank; the Coder and the 384 variant use different tables. */
+static constexpr std::array<uint16_t, DS41_N_LAYER * DS41_N_EXPERT>
+    kDefaultExpertRank = {
+#if DS41_VARIANT_CODER
+#include "expert_rank_coder.inc"
+#else
+#include "expert_rank.inc"
+#endif
+};
+
+static constexpr bool valid_default_rank() {
+  std::array<bool, DS41_N_LAYER * DS41_N_EXPERT> seen{};
+  for (uint32_t index : kDefaultExpertRank) {
+    if (index >= seen.size() || seen[index])
+      return false;
+    seen[index] = true;
+  }
+  return true;
+}
+static_assert(valid_default_rank());
+
+static std::vector<gufo::expert_stream::Ranked> DefaultExpertRanking() {
+  std::vector<gufo::expert_stream::Ranked> ranked;
+  ranked.reserve(kDefaultExpertRank.size());
+  for (size_t i = 0; i < kDefaultExpertRank.size(); ++i) {
+    const uint32_t index = kDefaultExpertRank[i];
+    ranked.push_back({index / DS41_N_EXPERT, index % DS41_N_EXPERT,
+                      static_cast<uint64_t>(kDefaultExpertRank.size() - i)});
+  }
+  return ranked;
+}
+
+static bool ParseExpertHistogram(
+    const std::string& path,
+    std::vector<gufo::expert_stream::Ranked>* ranking) {
+  std::ifstream in(path);
+  std::string magic;
+  if (!std::getline(in, magic) || magic != "DS41_EXPERT_HISTOGRAM_V1")
+    return false;
+  std::array<std::array<bool, DS41_N_EXPERT>, DS41_N_LAYER> seen{};
+  std::vector<gufo::expert_stream::Ranked> ranked;
+  std::string line;
+  while (std::getline(in, line)) {
+    uint32_t layer = 0, expert = 0;
+    uint64_t count = 0;
+    std::string extra;
+    std::istringstream row(line);
+    if (!(row >> layer >> expert >> count) || (row >> extra))
+      return false;
+    if (layer >= DS41_N_LAYER || expert >= DS41_N_EXPERT || !count ||
+        seen[layer][expert])
+      return false;
+    seen[layer][expert] = true;
+    ranked.push_back({layer, expert, count});
+  }
+  if (!in.eof())
+    return false;
+  std::sort(ranked.begin(), ranked.end(),
+            [](const gufo::expert_stream::Ranked& a,
+               const gufo::expert_stream::Ranked& b) {
+              if (a.count != b.count)
+                return a.count > b.count;
+              return a.layer != b.layer ? a.layer < b.layer
+                                        : a.expert < b.expert;
+            });
+  *ranking = std::move(ranked);
+  return true;
+}
+
+static void SelectExpertRanking(
+    const char* model_path, std::vector<gufo::expert_stream::Ranked>* ranking,
+    std::string* source) {
 #if DS41_VARIANT_CODER
   /* The Coder has one checked-in rank. Do not replace it with a histogram
    * beside the model, and do not fall back to another ranking. */
-  if (!ds41_expert_store_seed_default(e->expert_store))
-    fprintf(stderr, "ds41: failed to warm the Coder expert cache\n");
+  (void)model_path;
+  *ranking = DefaultExpertRanking();
+  *source = "built-in V4.1 Coder ranking";
 #else
-  const char* histogram = e->expert_histogram;
-  const bool custom = access(histogram, F_OK) == 0;
-  if (custom && !ds41_expert_store_seed(e->expert_store, histogram)) {
-    fprintf(stderr, "ds41: failed to load expert histogram %s; using the built-in ranking\n", histogram);
-    if (!ds41_expert_store_seed_default(e->expert_store))
-      fprintf(stderr, "ds41: failed to warm the expert cache\n");
-  } else if (!custom && !ds41_expert_store_seed_default(e->expert_store)) {
-    fprintf(stderr, "ds41: failed to warm the expert cache\n");
+  const std::string histogram =
+      std::string(model_path) + ".expert-histogram";
+  if (access(histogram.c_str(), F_OK) == 0) {
+    if (ParseExpertHistogram(histogram, ranking)) {
+      *source = histogram;
+      return;
+    }
+    fprintf(stderr,
+            "ds41: failed to load expert histogram %s; using the built-in "
+            "ranking\n",
+            histogram.c_str());
   }
+  *ranking = DefaultExpertRanking();
+  *source = "built-in V4.1 ranking";
 #endif
 }
 
@@ -1948,7 +2027,7 @@ int ds41_engine_open(ds41_engine** out, const ds41_engine_options* opt) {
       *out = NULL;
       return 1;
     }
-    const uint64_t available = ds41_expert_available_memory();
+    const uint64_t available = gufo::ext::HostAvailableBytes();
     const uint64_t resident =
         model_resident_bytes(e->model, e->weights, streaming) +
         (e->weights->router_bf16 ? (uint64_t)DS41_N_LAYER * kRouterElements * sizeof(uint16_t) : 0);
@@ -2008,7 +2087,12 @@ int ds41_engine_open(ds41_engine** out, const ds41_engine_options* opt) {
     }
 
     if (streaming) {
-      e->expert_store = ds41_expert_store_create(e->model, e->weights, opt->expert_cache_bytes);
+      std::vector<gufo::expert_stream::Ranked> ranking;
+      std::string ranking_source;
+      SelectExpertRanking(opt->model_path, &ranking, &ranking_source);
+      e->expert_store = ds41_expert_store_create(
+          e->model, e->weights, opt->expert_cache_bytes, ranking,
+          ranking_source.c_str());
       if (!e->expert_store) {
         fprintf(stderr, "ds41: failed to initialize the streamed expert store\n");
         ds41_engine_close(e);
@@ -2016,10 +2100,9 @@ int ds41_engine_open(ds41_engine** out, const ds41_engine_options* opt) {
         return 1;
       }
       const std::string tails = std::string(opt->model_path) + ".expert-tails";
-      if (access(tails.c_str(), F_OK) == 0)
-        (void)ds41_expert_store_attach_tails(e->expert_store, tails.c_str());
-      e->expert_histogram = strdup((std::string(opt->model_path) + ".expert-histogram").c_str());
-      seed_experts(e);
+      if (access(tails.c_str(), F_OK) == 0 &&
+          !ds41_expert_store_attach_tails(e->expert_store, tails.c_str()))
+        fprintf(stderr, "ds41: ignoring expert tails %s\n", tails.c_str());
     }
 
     *out = e;
@@ -2066,22 +2149,27 @@ bool ds41_engine_has_image_bias(const ds41_engine* e) {
     return e && e->image_bias;
 }
 
-/* Free memory the expert cache leaves when it is sized after the sessions:
- * buffers the first prompt still allocates (~0.8 GiB measured at 1, 2 and 4
- * sessions), transient prefill peaks (~0.3-0.6 GiB) and margin against swap. */
-static constexpr uint64_t kWarmHeadroom = 2ull << 30;
-
-int ds41_engine_fit_experts(ds41_engine* e, uint64_t pending_bytes) {
+int ds41_engine_fit_experts(ds41_engine* e, uint64_t grant_bytes) {
   if (!e || !e->expert_store)
     return 1;
-  if (!ds41_expert_store_set_reserve(e->expert_store, kWarmHeadroom + pending_bytes))
-    fprintf(stderr, "ds41: unable to fit the expert cache to the memory left after the sessions\n");
-  seed_experts(e);
+  if (!ds41_expert_store_fit(e->expert_store, grant_bytes)) {
+    fprintf(stderr, "ds41: unable to fit the expert cache to the host grant\n");
+    return 1;
+  }
   return 0;
 }
 
 ds41_expert_cache_status ds41_engine_expert_cache_status(const ds41_engine* e) {
   return ds41_expert_store_get_cache_status(e ? e->expert_store : nullptr);
+}
+
+gufo::expert_stream::Store* ds41_engine_expert_store(ds41_engine* e) {
+  return e && e->expert_store ? ds41_expert_store_native(e->expert_store)
+                              : nullptr;
+}
+
+uint64_t ds41_engine_expert_cache_headroom(const ds41_engine* e) {
+  return e && e->expert_store ? ds41_expert_store_headroom(e->expert_store) : 0;
 }
 
 bool ds41_engine_has_dspark(const ds41_engine* e) {
@@ -2106,7 +2194,6 @@ void ds41_engine_close(ds41_engine* e) {
     (void)hipFree(e->weights->router_bf16);
   ds41_expert_store_log(e->expert_store);
   ds41_expert_store_destroy(e->expert_store);
-  free(e->expert_histogram);
   weights_free(e->weights);
   if (e->dspark) {
     ds41_dspark_free(e->dspark);

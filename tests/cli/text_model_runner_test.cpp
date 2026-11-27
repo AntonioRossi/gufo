@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -691,6 +692,36 @@ void TestMeminfoAvailableExcludesFreeCma() {
          "missing MemAvailable keeps the caller's fallback");
 }
 
+void TestMeminfoByteRange() {
+  constexpr std::uint64_t first_overflow = std::uint64_t{1} << 54;
+  constexpr auto max_bytes = std::numeric_limits<std::uint64_t>::max();
+  const auto meminfo = [](std::uint64_t available, std::uint64_t cma_free) {
+    return "MemAvailable: " + std::to_string(available) +
+           " kB\nCmaFree: " + std::to_string(cma_free) + " kB\n";
+  };
+
+  const auto boundary = meminfo(first_overflow, first_overflow - 1);
+  const auto sample = gufo::ext::MeminfoSample(boundary);
+  Expect(sample && sample->available == max_bytes &&
+             sample->cma_free == max_bytes - 1023,
+         "only the unrepresentable byte count saturates");
+  Expect(gufo::ext::MeminfoAvailableBytes(boundary) == 1024,
+         "preserve a KiB of usable memory across the byte limit");
+
+  const auto above = meminfo(first_overflow + 1, first_overflow);
+  const auto large = gufo::ext::MeminfoSample(above);
+  Expect(large && large->available == max_bytes && large->cma_free == max_bytes,
+         "both oversized sample fields saturate");
+  Expect(gufo::ext::MeminfoAvailableBytes(above) == 1024,
+         "subtract free CMA before converting the difference to bytes");
+  Expect(
+      gufo::ext::MeminfoAvailableBytes(meminfo(first_overflow, 0)) == max_bytes,
+      "an unrepresentable difference saturates");
+  Expect(gufo::ext::MeminfoAvailableBytes(
+             meminfo(first_overflow - 1, first_overflow)) == 0,
+         "free CMA above available memory leaves zero usable bytes");
+}
+
 /// The host reserve and free CMA pages overlap (#1198): the OS keeps its
 /// reserve in pages pins cannot take, so the ceiling subtracts the larger of
 /// the two, never their sum, and still never counts CMA pages as pinnable.
@@ -1332,6 +1363,57 @@ void TestProviderToolDialectSelection() {
                (choice == ChatRequest::ToolChoice::kAuto),
            "only automatic tool choice admits a plain answer");
   }
+  // ToolGrammarSyntax and ReasoningGrammarMarkers select the grammar's
+  // spelling; parsing stays canonical.
+  {
+    class RawRunner final : public FakeRunner {
+    public:
+      RawRunner() : FakeRunner(std::make_shared<FakeStats>()) {}
+      std::shared_ptr<const gufo::sampling::ConstraintVocabulary>
+      BuildConstraintVocabulary() const override {
+        return std::make_shared<gufo::sampling::ConstraintVocabulary>(
+            256, [](std::uint32_t id) {
+              return gufo::sampling::ConstraintVocabulary::Piece{
+                  std::string(1, static_cast<char>(id)), false};
+            });
+      }
+      std::optional<Constraint::ToolSyntax> ToolGrammarSyntax(
+          const ChatRequest&) const override {
+        return syntax_;
+      }
+      std::optional<gufo::ext::ReasoningMarkup> ReasoningGrammarMarkers(
+          const ChatRequest&) const override {
+        return gufo::ext::ReasoningMarkup{"[[raw>>", "<<raw]]"};
+      }
+      Constraint::ToolSyntax syntax_;
+    };
+    RawRunner raw;
+    raw.syntax_ = syntax;
+    ChatRequest request;
+    request.messages.emplace_back(gufo::tokenization::ChatRole::kUser, "go");
+    request.tool_choice = ChatRequest::ToolChoice::kRequired;
+    request.tools = {
+        {.name = "record",
+         .parameters_json =
+             R"({"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false})"}};
+    gufo::sampling::SamplingConfig sampling;
+    std::optional<Constraint::ToolFormat> format;
+    std::string dialect;
+    const auto constrained = gufo::server::ConstrainChatRequest(
+        request, raw, &sampling, &format, &dialect);
+    Expect(dialect == "json" && format == Constraint::ToolFormat::kJson,
+           "parsing keeps the published dialect");
+    Expect(constrained && constrained->messages.front().framing_suffix.empty(),
+           "a native grammar syntax adds no JSON-call instruction");
+    const auto& grammar = *sampling.constraint->grammar;
+    Expect(
+        accepts(grammar, call) && accepts(grammar, "[[raw>>x<<raw]]" + call) &&
+            !accepts(grammar, "<think>x</think>" + call) &&
+            !accepts(
+                grammar,
+                R"(<tool_call>{"name":"record","arguments":{"text":"hi"}}</tool_call>)"),
+        "the grammar is written in the model's own spelling");
+  }
   // The reasoning phase of the grammar uses the runner's delimiters.
   const auto constrain = [](const DialectRunner& reasoner, bool tools,
                             std::optional<bool> enabled = {}) {
@@ -1369,11 +1451,15 @@ void TestProviderToolDialectSelection() {
     Expect(!accepts(*automatic, "<think>\nPlan.</think>" + answer) &&
                !accepts(*automatic, "[[ponder>>Plan.<<ponder]]" + answer),
            "other reasoning framing is no reasoning of this provider");
+    // A runner that cannot turn reasoning off keeps kAuto when the request
+    // disables it (Inkling's lowest effort still thinks); one that can closes
+    // it in the prompt and reports content (below).
     const auto disabled = constrain(
         DialectRunner("ledger-runner", ponder, Initial::kAuto), tools, false);
-    Expect(!accepts(*disabled, "[[ponder>>\nPlan.<<ponder]]" + answer) &&
-               accepts(*disabled, answer),
-           "disabled reasoning admits no reasoning phase");
+    Expect(
+        accepts(*disabled, "[[ponder>>\nPlan.<<ponder]]" + answer) &&
+            accepts(*disabled, answer),
+        "kAuto keeps the model's own reasoning when the request disables it");
     for (const auto initial :
          {Initial::kContent, Initial::kContentAfterReasoning}) {
       const auto content =
@@ -1425,10 +1511,37 @@ void LegacyResourceClaimAggregateKeepsItsFields() {
              !claim.prompt_admission_budget_bytes &&
              !claim.prompt_admission_available_bytes,
          "legacy aggregate initializers leave prompt admission disabled");
+  Expect(!claim.expert_cache.store &&
+             !claim.expert_cache.prompt_cache_share_per_session_bytes,
+         "legacy aggregate initializers stream no experts");
+}
+
+void ExpertCacheClaimBoundsTheAutomaticBudget() {
+  // The store is incomplete here; only its address is compared, never used.
+  std::byte storage{};
+  auto* store = reinterpret_cast<gufo::expert_stream::Store*>(&storage);
+  gufo::ext::TextRunnerResourceClaim claim{};
+  claim.retained_snapshot_capacity_bytes = 10u << 20;
+  Expect(!claim.expert_cache.store &&
+             gufo::ext::AutomaticRetainedBytes(claim, 4) == (10u << 20),
+         "a runner without streamed experts keeps its automatic budget");
+  claim.expert_cache.prompt_cache_share_per_session_bytes = 1u << 20;
+  Expect(gufo::ext::AutomaticRetainedBytes(claim, 4) == (10u << 20),
+         "a share without a store is ignored");
+  claim.expert_cache.store = store;
+  Expect(gufo::ext::AutomaticRetainedBytes(claim, 1) == (1u << 20) &&
+             gufo::ext::AutomaticRetainedBytes(claim, 3) == (3u << 20),
+         "the share scales with the sessions");
+  Expect(gufo::ext::AutomaticRetainedBytes(claim, 16) == (10u << 20),
+         "the share never raises the measured budget");
+  claim.expert_cache.prompt_cache_share_per_session_bytes.reset();
+  Expect(gufo::ext::AutomaticRetainedBytes(claim, 2) == (10u << 20),
+         "a store without a share keeps the automatic budget");
 }
 
 int main() {
   LegacyResourceClaimAggregateKeepsItsFields();
+  ExpertCacheClaimBoundsTheAutomaticBudget();
   TestPromptCountingValidatesCapabilitiesBeforeInference();
   TestServerInstructionsAreFraming();
   TestReasoningDelimitersFollowTheRunner();
@@ -1441,6 +1554,7 @@ int main() {
   TestResourceClaimsAreValidatedBeforeAllocation();
   TestRamCacheOptionParsing();
   TestMeminfoAvailableExcludesFreeCma();
+  TestMeminfoByteRange();
   TestSnapshotCeilingOverlapsCmaWithReserve();
   TestCgroupAvailableCountsReclaimableCache();
   std::cout << "All text model runner tests passed\n";

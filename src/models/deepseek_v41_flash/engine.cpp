@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdlib>
+#include <gufo/ext/host_budget.hpp>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -269,13 +270,26 @@ bool Model::StreamsExperts() const noexcept {
   return options_.stream_experts;
 }
 
-void Model::FitExpertCache(std::uint64_t pending_bytes) {
-  if (options_.stream_experts)
-    (void)ds41_engine_fit_experts(engine_, pending_bytes);
+bool Model::FitExpertCache(std::uint64_t headroom_bytes) {
+  if (!options_.stream_experts)
+    return true;
+  const std::uint64_t available = gufo::ext::HostAvailableBytes();
+  const std::uint64_t grant =
+      available > headroom_bytes ? available - headroom_bytes : 0;
+  return ds41_engine_fit_experts(engine_, grant) == 0;
 }
 
 ds41_expert_cache_status Model::ExpertCacheStatus() const {
   return ds41_engine_expert_cache_status(engine_);
+}
+
+gufo::expert_stream::Store* Model::ExpertStore() const {
+  return options_.stream_experts ? ds41_engine_expert_store(engine_) : nullptr;
+}
+
+std::uint64_t Model::ExpertCacheHeadroom() const {
+  return options_.stream_experts ? ds41_engine_expert_cache_headroom(engine_)
+                                 : 0;
 }
 
 bool Model::EnableImageRouting(std::string* error_msg) {

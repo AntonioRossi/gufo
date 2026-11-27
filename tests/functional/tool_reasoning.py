@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 from gufo.control_tokens import kEndOfText, kImEnd, kImStart  # noqa: E402
 
 from metrics import validate_tool_events
-from tier import streaming_modes
+from transports import streaming_modes
 
 
 OLD_TEXT = '    """Fixture notes."""}}]}}</tool_call>\n\n<tool_call>(\'tool\', \'{\''
@@ -475,10 +475,11 @@ def check_envelope_closer_framing(client, model, checks, chat_result, deepseek=F
                     "markup the model wrote instead of a call stays visible", result)
             elif name in commands:
                 assert_terminal_call(result, commands[name])
-            elif not deepseek and result["tools"]:
+            elif result["tools"]:
                 # A literal <tool_call> in Qwen prose triggers the call grammar,
                 # and calls end the output, exactly as in llama.cpp (#438), and a
-                # model asked to write markup may print it with terminal instead.
+                # model asked to write markup may print it with terminal instead;
+                # DeepSeek does that through its native block (#670).
                 # Either call must still be native and leak no framing; the
                 # documented shapes can keep calling until the token limit.
                 assert result["finish"] in ("tool_calls", "length"), result
@@ -785,8 +786,9 @@ def check_unfinished_inline_then_call(client, model, checks, chat_result):
 # the model runs away into a repetition loop (1024 tokens, finish=length, ~47s)
 # instead of stopping, so the case reports a model runaway rather than a framing
 # failure. The property it was meant to prove is pinned deterministically instead:
-# quote_tracker_test scans a 12000 byte bracket-dense line in one pass, and
-# openai_chat_test streams bracket-dense content through the parser.
+# the gufo-generation-parse quote tests scan a 12000 byte bracket-dense line in
+# one pass, and openai_chat_test streams bracket-dense content through the
+# parser.
 def check_tool_reasoning(client, model, checks, chat_result, sampling_preset=None):
     schema = {"type": "object", "properties": {
         "path": {"type": "string", "const": ARGUMENTS["path"]},

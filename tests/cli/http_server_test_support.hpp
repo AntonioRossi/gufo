@@ -98,6 +98,8 @@ public:
     return prompt_budget;
   }
   std::optional<PromptAdmissionBudget> prompt_budget;
+  std::optional<SharedState> shared_state() const override { return shared; }
+  std::optional<SharedState> shared;
   std::string model_path() const override { return served_path; }
   std::string build_info() const override { return served_build; }
   std::string served_path;
@@ -353,6 +355,19 @@ public:
               },
       };
     });
+    // Streams one event, then holds the response open until the test
+    // releases `held_stream`.
+    server.add("POST", "/sse-held", [this](const auto&, auto&) {
+      return gufo::server::HttpResponse{
+          .headers = {{"Content-Type", "text/event-stream"}},
+          .streaming_body =
+              [this](const auto& write) {
+                (void)write("data: first\n\n");
+                held_stream.acquire();
+                (void)write("data: [DONE]\n\n");
+              },
+      };
+    });
     server.add("POST", "/sse-finish", [](const auto& request, auto&) {
       return gufo::server::HttpResponse{
           .headers = {{"Content-Type", "text/event-stream"}},
@@ -429,6 +444,7 @@ public:
   }
 
   std::shared_ptr<FakeBackend> backend;
+  std::binary_semaphore held_stream{0};
   HttpServer server;
   std::binary_semaphore run_finished{0};
   std::jthread worker;

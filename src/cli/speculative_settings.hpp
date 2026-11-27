@@ -33,19 +33,29 @@ struct SpeculativeSettings {
   std::string draft_policy;
 };
 
-/// Before a model is selected: throws std::invalid_argument when the flags
-/// cannot hold for any available provider (a policy without `backend`, or one
-/// no provider accepts for it; a minimum above an explicit maximum).
-void CheckSpeculativeFlags(const ext::Registry& registry,
-                           std::string_view backend,
-                           const SpeculativeFlags& flags);
-
 /// The settings `provider` runs `backend` with. Throws std::invalid_argument
 /// when it does not accept the given policy or the minimum exceeds the limit.
 /// An empty backend (no speculation) resolves to the host's values.
 SpeculativeSettings ResolveSpeculativeSettings(
     const ext::TextProvider& provider, std::string_view backend,
     const SpeculativeFlags& flags);
+
+/// The configuration a runner loads with for `backend` ("" or "off" disables
+/// speculation), drafting from the model the backend's own option names; the
+/// draft settings stay the host's until `ApplySpeculativeSettings`. Throws
+/// std::invalid_argument for an unknown backend. An empty draft model is kept
+/// for every backend: the runner rejects it unless its checkpoint carries its
+/// own draft, as `gufo serve` leaves it to the runner.
+ext::TextSpeculativeConfig SpeculativeConfigFor(
+    std::string_view backend, const std::string& mtp_model_path,
+    const std::string& dflash_model_path, const std::string& dspark_model_path);
+
+/// Throws std::invalid_argument when `backend` has no draft model. A provider's
+/// own drivers read the draft model from the command line, so they require it.
+void RequireDraftModel(std::string_view backend,
+                       const std::string& mtp_model_path,
+                       const std::string& dflash_model_path,
+                       const std::string& dspark_model_path);
 
 /// Stores `settings` in `config`, including the DFlash2 policy they name.
 void ApplySpeculativeSettings(const SpeculativeSettings& settings,

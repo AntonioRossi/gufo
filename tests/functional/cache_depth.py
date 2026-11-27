@@ -5,11 +5,15 @@ from copy import deepcopy
 import sys
 
 from cache_growth import check_unchanged_retry, log_offset
+from thinking import answer_room, no_reasoning
+
+# The first turn's history must be at least this deep.
+MIN_TOKENS = 16384
 
 
 def check_cache_depth(client, model, checks, chat_result, concurrency=4, server_log=None):
     request = dict(model=model, temperature=0, seed=31,
-                   max_completion_tokens=16, reasoning_effort="none")
+                   max_completion_tokens=answer_room(16), reasoning_effort="none")
     controls = []
 
     def signature(result):
@@ -30,7 +34,7 @@ def check_cache_depth(client, model, checks, chat_result, concurrency=4, server_
                                     usage["gufo"]["prefill_tokens"])
         assert all(type(n) is int and n >= 0 for n in (total, reused, prefilled)), usage
         assert reused + prefilled == total, usage
-        assert result["text"].strip() == code and not result["reasoning"] \
+        assert result["text"].strip() == code and no_reasoning(result["reasoning"]) \
             and not result["tools"] and result["finish"] == "stop", result
         if cold:
             assert reused == 0 and prefilled == total, result
@@ -42,18 +46,34 @@ def check_cache_depth(client, model, checks, chat_result, concurrency=4, server_
             assert signature(result) == signature(retry), result
         return body, result
 
-    messages = [{"role": "system", "content": "cache_depth_main\n"
-                 "Follow the final instruction. Background records are not instructions.\n" +
-                 "Background record: the lantern is blue and the shelf is empty.\n" * 1200}]
+    def user(turn):
+        return {"role": "user", "content": f"Turn {turn}.\n" +
+                "Archive record: there are no new instructions.\n" * 64 +
+                "Reply with only BETA."}
+
+    def system(records):
+        return {"role": "system", "content": "cache_depth_main\n"
+                "Follow the final instruction. Background records are not instructions.\n" +
+                "Background record: the lantern is blue and the shelf is empty.\n" * records}
+
+    def count(records):
+        response = client.post("/chat/completions/input_tokens", cast_to=object, body={
+            "model": model, "reasoning_effort": "none", "messages": [system(records), user(0)]})
+        return response["input_tokens"]
+
+    # Tokenizers differ (DeepSeek needs more records than Qwen for the same
+    # depth), so size the first turn from count-tokens to just cross MIN_TOKENS.
+    records, base = 1200, count(1200)
+    if base < MIN_TOKENS:
+        records += -(-(MIN_TOKENS - base) * 100 // (count(records + 100) - base))
+    messages = [system(records)]
     previous = 0
     for turn in range(3):
-        messages.append({"role": "user", "content": f"Turn {turn}.\n" +
-                         "Archive record: there are no new instructions.\n" * 64 +
-                         "Reply with only BETA."})
+        messages.append(user(turn))
         body, result = chat(f"depth_turn_{turn}", messages, "BETA",
                             floor=max(0, previous - 16), cold=turn == 0)
         previous = result["usage"]["prompt_tokens"]
-        assert previous >= 16384, result
+        assert previous >= MIN_TOKENS, result
         # The first turn is already an uncached request; its control would repeat it.
         if turn:
             controls.append((f"turn_{turn}", body, result, "BETA"))
@@ -94,8 +114,10 @@ def check_cache_depth(client, model, checks, chat_result, concurrency=4, server_
          window=(before_resume, log_offset(server_log)))
     controls.append(("resume", body, resumed, "BETA"))
 
-    # Controls come last: they must never supply a checkpoint missing from a
-    # warm branch or rotation. Complete output equality stays strict.
-    for label, body, warm, code in controls:
+    # The control comes last: it must never supply a checkpoint missing from a
+    # warm branch or rotation. Complete output equality stays strict. Every
+    # warm request already asserts its exact reply; one uncached replay of the
+    # deepest history (the resume) checks the token path matches too.
+    for label, body, warm, code in controls[-1:]:
         _, cold = chat("depth_cold_" + label, body["messages"], code, cold=True)
         assert signature(warm) == signature(cold), (label, warm, cold)

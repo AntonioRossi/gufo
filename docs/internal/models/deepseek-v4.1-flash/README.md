@@ -23,11 +23,14 @@ The bundles contain several routed expert types; neither is uniform.
 The selected check mode streams routed experts from SSD with
 `--stream-experts --expert-cache-bytes 68719476736` for the 384 variant.
 The source runtime keeps dense weights resident. The cache value is an
-upper limit; the cache can be smaller after session allocation. The adapter
-allocates every selected session and its long-lived buffers before
-`Model::FitExpertCache`, then reports the requested limit and actual cache
-through `event=expert_streaming`. Without the options, the runtime retains
-its resident default. The imported loader reads Engram data from the SSD.
+upper limit; the cache can be smaller after session allocation. Serving
+prepares the selected sessions and the prompt-cache backing. The host logs
+`event=expert_cache_grant` with the grant before it calls `Store::Fit`. The
+effective cache limit is available after the fit from `ExpertCacheStatus`
+and `Store::LimitBytes()`. The standalone prompt and chat paths fit once
+through the runner claim; the benchmark fits once after its first normal
+session. Without the options, the runtime retains its resident default. The
+imported loader reads Engram data from the SSD.
 
 The HTTP interface supports function tools, assistant tool-call history,
 and tool results. It uses the source V4.1 DSML grammar and scanner.

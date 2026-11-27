@@ -53,6 +53,8 @@ std::vector<int> MakeDeepSeekBenchmarkTokens(const Model& model,
   return tokens;
 }
 
+constexpr std::uint64_t kBenchmarkHeadroom = 4ull << 30;
+
 void PrintExpertCache(const Model& model) {
   const auto cache = model.ExpertCacheStatus();
   std::cerr << "[Expert Cache]: requested_bytes=" << cache.requested_bytes
@@ -131,7 +133,6 @@ int RunDeepSeekBenchmark(const ext::TextBenchOptions& options,
                                              load_start)
                    .count()
             << " s\n";
-  PrintExpertCache(*model);
   const auto tokens = MakeDeepSeekBenchmarkTokens(*model, required_context);
   const double size_gib =
       static_cast<double>(reader->GetSize()) / (1024.0 * 1024.0 * 1024.0);
@@ -144,6 +145,19 @@ int RunDeepSeekBenchmark(const ext::TextBenchOptions& options,
   };
   std::cout << "| model | size | backend | test | t/s |\n"
                "| --- | --- | --- | --- | --- |\n";
+
+  bool fitted = false;
+  const auto fit_expert_cache = [&]() -> bool {
+    if (fitted || !expert_options.stream_experts)
+      return true;
+    if (!model->FitExpertCache(kBenchmarkHeadroom)) {
+      std::cerr << "Error fitting the DeepSeek expert cache\n";
+      return false;
+    }
+    PrintExpertCache(*model);
+    fitted = true;
+    return true;
+  };
 
   // Preserve the source order: all prefill repetitions, then all decode
   // repetitions. The model and expert store remain alive across sessions.
@@ -158,6 +172,8 @@ int RunDeepSeekBenchmark(const ext::TextBenchOptions& options,
         std::cerr << "Error creating DeepSeek session: " << error << '\n';
         return 1;
       }
+      if (!fit_expert_cache())
+        return 1;
       const auto start = std::chrono::steady_clock::now();
       if (!session->Sync(std::span(tokens).first(prompt_length), &error)) {
         std::cerr << "Error running DeepSeek prefill: " << error << '\n';
@@ -181,7 +197,13 @@ int RunDeepSeekBenchmark(const ext::TextBenchOptions& options,
          ++repetition) {
       auto session = model->CreateSession(core::SessionMode::kAutoregressive,
                                           required_context, &error);
-      if (!session || !session->Sync(std::span(tokens).first(16), &error)) {
+      if (!session) {
+        std::cerr << "Error creating DeepSeek session: " << error << '\n';
+        return 1;
+      }
+      if (!fit_expert_cache())
+        return 1;
+      if (!session->Sync(std::span(tokens).first(16), &error)) {
         std::cerr << "Error preparing DeepSeek generation: " << error << '\n';
         return 1;
       }

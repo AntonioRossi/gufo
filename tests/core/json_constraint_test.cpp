@@ -2,18 +2,23 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <barrier>
 #include <cassert>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <initializer_list>
 #include <iostream>
 #include <limits>
+#include <new>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
 #include <utility>
 
+#include "src/core/json_constraint_describe.hpp"
 #include "src/core/sampling.hpp"
 
 using gufo::json::parse;
@@ -27,6 +32,90 @@ bool Accepts(const JsonConstraint& grammar, std::string_view text) {
       return false;
   }
   return grammar.Complete(state);
+}
+
+// A required tagged call may follow a short gap, not unbounded whitespace.
+void TestRequiredTaggedCallLeadingSpace() {
+  using Format = JsonConstraint::ToolFormat;
+  const auto syntax = JsonConstraint::Syntax(Format::kQwen);
+  const auto schema = parse(R"({"type":"object","properties":{
+    "city":{"type":"string"}},"required":["city"],"additionalProperties":false})");
+  std::vector<JsonConstraint::Tool> tools;
+  tools.emplace_back("get_weather",
+                     JsonConstraint::ToolParameters(schema, false, syntax));
+  const auto required =
+      JsonConstraint::WithTools(nullptr, std::move(tools), true, false, syntax);
+  const std::string call =
+      "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n"
+      "</parameter>\n</function>\n</tool_call>";
+  for (const auto gap : {"", " ", "\n", "\n\n", "\n  "})
+    assert(Accepts(*required, gap + call));
+  assert(!Accepts(*required, "\n\n\n" + call));
+  assert(!Accepts(*required, std::string(200, '\n') + call));
+}
+
+void TestNativeToolRequiredAlternatives() {
+  using Format = JsonConstraint::ToolFormat;
+  const auto schema = parse(R"({"type":"object","properties":{
+    "path":{"type":"string"},"content":{"type":"string"},
+    "markdown":{"type":"string"},"base64":{"type":"string"},
+    "name":{"type":"string"},"mime":{"type":"string"}},
+    "anyOf":[{"required":["path"]},{"required":["content"]},
+             {"required":["markdown"]},{"required":["base64"]}]})");
+  auto named = schema;
+  named["required"] = parse(R"(["name"])");
+  auto paired = named;
+  paired["anyOf"] =
+      parse(R"([{"required":["path","mime"]},{"required":["markdown"]}])");
+
+  for (const auto format : {Format::kQwen, Format::kDeepSeek}) {
+    const auto parameter = [&](std::string_view name, std::string_view value) {
+      return format == Format::kQwen
+                 ? "<parameter=" + std::string(name) + ">\n" +
+                       std::string(value) + "\n</parameter>\n"
+                 : "<｜DSML｜parameter name=\"" + std::string(name) +
+                       "\" string=\"true\">" + std::string(value) +
+                       "</｜DSML｜parameter>\n";
+    };
+    const auto path = parameter("path", "/workspace/notes.md");
+    const auto content = parameter("content", "Notes");
+    const auto markdown = parameter("markdown", "# Notes");
+    const auto base64 = parameter("base64", "YWJj");
+    const auto name = parameter("name", "notes.md");
+    const auto mime = parameter("mime", "text/markdown");
+    const auto grammar = JsonConstraint::ToolParameters(schema, false, format);
+    for (const auto& source : {path, content, markdown, base64})
+      assert(Accepts(*grammar, source));
+    assert(Accepts(*grammar, path + markdown));
+    assert(Accepts(*grammar, markdown + path));
+    assert(Accepts(*grammar, name + path + mime));
+    assert(!Accepts(*grammar, ""));
+    assert(!Accepts(*grammar, name + mime));
+    assert(!Accepts(*grammar, path + path));
+
+    const auto common = JsonConstraint::ToolParameters(named, false, format);
+    assert(Accepts(*common, path + name));
+    assert(Accepts(*common, name + content));
+    assert(!Accepts(*common, path));
+    assert(!Accepts(*common, name));
+
+    const auto multi = JsonConstraint::ToolParameters(paired, false, format);
+    assert(Accepts(*multi, mime + name + path));
+    assert(Accepts(*multi, name + markdown));
+    assert(!Accepts(*multi, path + name));
+    assert(!Accepts(*multi, mime + name));
+
+    auto wide = paired;
+    for (unsigned i = 0; i < 5; ++i)
+      wide["properties"]["extra" + std::to_string(i)] =
+          parse(R"({"type":"string"})");
+    const auto wide_grammar =
+        JsonConstraint::ToolParameters(wide, false, format);
+    assert(Accepts(*wide_grammar, path + mime + name));
+    assert(Accepts(*wide_grammar, name + markdown));
+    assert(!Accepts(*wide_grammar, name + path));
+    assert(!Accepts(*wide_grammar, markdown));
+  }
 }
 
 void TestWideNativeArgumentOrder() {
@@ -3017,7 +3106,309 @@ void TestObjectMemberOrders() {
   }
 }
 
+// Call lists with keyword arguments, and calls that repeat their name.
+void TestProviderCallListAndKeywordSyntax() {
+  const JsonConstraint::ToolSyntax python{
+      .open = "<|call|>[",
+      .name_suffix = "(",
+      .close = ")",
+      .call_separator = ", ",
+      .block_close = "]<|end|>",
+      .name_delimiters = "( ",
+      .values = {.string_open = "'", .string_close = "'", .keyword_root = true},
+  };
+  const auto schema = parse(R"({"type":"object","properties":{
+    "city":{"type":"string"},"units":{"type":"string","enum":["c","f"]},
+    "days":{"type":"integer"},"on":{"type":"boolean"},"nothing":{"type":"null"},
+    "tags":{"type":"array","items":{"type":"string"}}},
+    "required":["city"],"additionalProperties":false})");
+  const auto empty = parse(
+      R"({"type":"object","properties":{},"additionalProperties":false})");
+  const auto build = [&](bool parallel) {
+    std::vector<JsonConstraint::Tool> tools;
+    tools.emplace_back("weather",
+                       JsonConstraint::ToolParameters(schema, false, python));
+    tools.emplace_back("clock",
+                       JsonConstraint::ToolParameters(empty, false, python));
+    return JsonConstraint::WithTools(nullptr, std::move(tools), true, parallel,
+                                     python);
+  };
+  const auto many = build(true);
+  const auto one = build(false);
+  assert(Accepts(*many, "<|call|>[weather(city='Paris')]<|end|>"));
+  assert(Accepts(*many,
+                 "<|call|>[weather(city=\"Paris\", days=3, on=True, "
+                 "nothing=None, tags=[\"a\", \"b\"])]<|end|>"));
+  assert(Accepts(*many, "<|call|>[weather(city='Paris', units='c')]<|end|>"));
+  assert(Accepts(
+      *many, "<|call|>[weather(city='Paris', on=false, nothing=null)]<|end|>"));
+  assert(
+      Accepts(*many, "<|call|>[clock(), weather(city='A'), clock()]<|end|>"));
+  assert(Accepts(*one, "<|call|>[clock()]<|end|>"));
+  assert(!Accepts(*one, "<|call|>[clock(), clock()]<|end|>"));
+  assert(!Accepts(*many, "<|call|>[weather(city='Paris')"));
+  assert(!Accepts(*many, "<|call|>[weather(city='Paris') clock()]<|end|>"));
+  assert(!Accepts(*many, "<|call|>[weather()]<|end|>"));
+  assert(!Accepts(*many, "<|call|>[weather(city='Paris', units='k')]<|end|>"));
+  assert(!Accepts(*many, "<|call|>[weather(city=1)]<|end|>"));
+  assert(!Accepts(*many, "<|call|>[weather(city='Paris', days=True)]<|end|>"));
+  assert(!Accepts(*many, "<|call|>[weather(city='Paris', tags=['a'])]<|end|>"));
+  assert(!Accepts(*many, "<|call|>[weather(city='Paris', city='X')]<|end|>"));
+  assert(!Accepts(*many, "<|call|>[weather(city='Paris')]<|end|>x"));
+  // A property that is no identifier cannot be a keyword argument.
+  bool rejected = false;
+  try {
+    (void)JsonConstraint::ToolParameters(
+        parse(R"({"type":"object","properties":{"a-b":{"type":"string"}},
+          "required":["a-b"],"additionalProperties":false})"),
+        true, python);
+  } catch (const std::invalid_argument&) {
+    rejected = true;
+  }
+  assert(rejected);
+  // Without a schema, any keyword arguments.
+  std::vector<JsonConstraint::Tool> loose;
+  loose.emplace_back("f", JsonConstraint::OpenToolParameters(python));
+  const auto any =
+      JsonConstraint::WithTools(nullptr, std::move(loose), true, false, python);
+  assert(Accepts(*any, "<|call|>[f()]<|end|>"));
+  assert(
+      Accepts(*any, "<|call|>[f(x=1, y='z', z={\"k\": [1]}, w=None)]<|end|>"));
+  assert(!Accepts(*any, "<|call|>[f(1)]<|end|>"));
+  assert(!Accepts(*any, "<|call|>[f(x 1)]<|end|>"));
+
+  // The function's name twice and one message per call.
+  const JsonConstraint::ToolSyntax channels{
+      .open = " to=",
+      .name_suffix = "<|msg|>",
+      .repeat_prefix = "<call name=\"",
+      .repeat_suffix = "\">",
+      .close = "</call>",
+      .call_separator = "<|next|>",
+      .name_delimiters = "<\" ",
+      .tagged = JsonConstraint::TaggedArguments{.parameter_open = "<p ",
+                                                .raw_value_open = ">",
+                                                .typed_value_open = ">",
+                                                .value_close = "</p>"},
+  };
+  const auto cschema = parse(
+      R"({"type":"object","properties":{"a":{"type":"string"}},
+    "required":["a"],"additionalProperties":false})");
+  std::vector<JsonConstraint::Tool> ctools;
+  ctools.emplace_back("f",
+                      JsonConstraint::ToolParameters(cschema, false, channels));
+  ctools.emplace_back("g",
+                      JsonConstraint::ToolParameters(cschema, false, channels));
+  const auto calls = JsonConstraint::WithTools(nullptr, std::move(ctools), true,
+                                               true, channels);
+  assert(Accepts(*calls, " to=f<|msg|><call name=\"f\"><p a>x</p></call>"));
+  assert(Accepts(*calls,
+                 " to=f<|msg|><call name=\"f\"><p a>x</p></call><|next|> "
+                 "to=g<|msg|><call name=\"g\"><p a>y</p></call>"));
+  assert(!Accepts(*calls, " to=f<|msg|><call name=\"g\"><p a>x</p></call>"));
+  assert(!Accepts(*calls,
+                  " to=f<|msg|><call name=\"f\"><p a>x</p></call> "
+                  "to=g<|msg|><call name=\"g\"><p a>y</p></call>"));
+  assert(!Accepts(*calls, " to=h<|msg|><call name=\"h\"><p a>x</p></call>"));
+}
+
+// Every way a schema becomes a grammar: response formats (strict or not,
+// closed or open objects) and tool parameters in each built-in syntax.
+std::vector<std::string> GrammarDigests(const gufo::json::Value& schema) {
+  using Format = JsonConstraint::ToolFormat;
+  const auto digest = [](const std::string& text) {
+    std::uint64_t hash = 14695981039346656037ull;
+    for (unsigned char byte : text)
+      hash = (hash ^ byte) * 1099511628211ull;
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out(16, '0');
+    for (int i = 15; i >= 0; --i, hash >>= 4)
+      out[static_cast<std::size_t>(i)] = kHex[hash & 15];
+    return out;
+  };
+  const auto describe = [&](const auto& build) {
+    try {
+      return digest(DescribeJsonConstraint(*build()));
+    } catch (const std::exception& error) {
+      return digest(std::string("error ") + error.what());
+    }
+  };
+  std::vector<std::string> digests;
+  for (const bool strict : {false, true})
+    for (const bool open : {false, true})
+      digests.push_back(describe(
+          [&] { return JsonConstraint::Compile(schema, strict, open); }));
+  for (const bool strict : {false, true})
+    for (const auto format : {Format::kJson, Format::kQwen, Format::kDeepSeek})
+      digests.push_back(describe([&] {
+        return JsonConstraint::ToolParameters(schema, strict, format);
+      }));
+  return digests;
+}
+
+// Compiled grammars stay byte-identical across compiler changes that must
+// not alter them. The fixture holds the schemas of these tests, of
+// openai_chat_test, of the llama.cpp goldens and seeded generated unions,
+// intersections and references, each with the digest of every grammar built
+// from it. --write-grammar-digests records them again after an intended
+// grammar change.
+void TestGrammarDigests(bool write) {
+  std::ifstream in(GUFO_JSON_CONSTRAINT_GRAMMARS);
+  assert(in && "grammar digests are present");
+  const auto fixture =
+      parse(std::string(std::istreambuf_iterator<char>(in), {}));
+  in.close();
+  std::size_t index = 0, grammars = 0, differences = 0;
+  std::vector<gufo::json::Value> rows;
+  for (const auto& row : fixture.find("schemas")->items()) {
+    const auto digests = GrammarDigests(*row.find("schema"));
+    if (write) {
+      auto list = gufo::json::Value::array();
+      for (const auto& digest : digests)
+        list.push_back(digest);
+      rows.push_back(row);
+      rows.back()["digests"] = std::move(list);
+    } else {
+      const auto& expected = row.find("digests")->items();
+      assert(expected.size() == digests.size());
+      for (std::size_t mode = 0; mode < digests.size(); ++mode, ++grammars)
+        if (expected[mode].str() != digests[mode]) {
+          std::cerr << "grammar digest mismatch: schema " << index << " mode "
+                    << mode << " " << row.find("schema")->dump() << "\n";
+          ++differences;
+        }
+    }
+    ++index;
+  }
+  if (write) {
+    std::ofstream out(GUFO_JSON_CONSTRAINT_GRAMMARS);
+    out << "{\"note\":" << fixture.find("note")->dump() << ",\"schemas\":[\n";
+    for (std::size_t i = 0; i < rows.size(); ++i)
+      out << (i ? ",\n" : "") << rows[i].dump();
+    out << "\n]}\n";
+    return;
+  }
+  assert(differences == 0);
+  assert(grammars >= 6000);
+}
+
+// Live heap bytes and their peak, from the replaceable allocation functions
+// below, so tests can bound a compile's memory on every platform.
+static std::atomic<std::size_t> heap_bytes{0}, heap_peak{0};
+
+void* operator new(std::size_t size) {
+  constexpr std::size_t kHeader = alignof(std::max_align_t);
+  auto* block = static_cast<unsigned char*>(std::malloc(size + kHeader));
+  if (!block)
+    throw std::bad_alloc();
+  *reinterpret_cast<std::size_t*>(block) = size;
+  const auto live = heap_bytes.fetch_add(size) + size;
+  for (auto peak = heap_peak.load();
+       live > peak && !heap_peak.compare_exchange_weak(peak, live);) {
+  }
+  return block + kHeader;
+}
+void* operator new[](std::size_t size) {
+  return operator new(size);
+}
+void operator delete(void* pointer) noexcept {
+  if (!pointer)
+    return;
+  constexpr std::size_t kHeader = alignof(std::max_align_t);
+  auto* block = static_cast<unsigned char*>(pointer) - kHeader;
+  heap_bytes.fetch_sub(*reinterpret_cast<std::size_t*>(block));
+  std::free(block);
+}
+void operator delete[](void* pointer) noexcept {
+  operator delete(pointer);
+}
+void operator delete(void* pointer, std::size_t) noexcept {
+  operator delete(pointer);
+}
+void operator delete[](void* pointer, std::size_t) noexcept {
+  operator delete(pointer);
+}
+
+// A definition whose union or intersection names itself several times once
+// cost branches^8 visits to classify each parameter's value kinds, before
+// any grammar was built: 32 branches would take about 10^12 visits. A chain
+// of definitions that each name the next several times, reached through a
+// `$ref` or `anyOf` with sibling constraints, once expanded into
+// branches^length intersections: 21 s and 6.4 GB per compile for a 2.6 KB
+// schema. The chains now stop at the intersection budget, which strict
+// compilation reports; non-strict native arguments fall back as other
+// over-budget schemas do. Work is bounded by those outcomes and the heap
+// peak; the generous time limit only guards against a hang.
+void TestRecursiveCombinatorsCompileQuickly() {
+  using Format = JsonConstraint::ToolFormat;
+  constexpr auto kHang = std::chrono::seconds(30);
+  const auto bounded = [&](const gufo::json::Value& schema) {
+    const auto start = std::chrono::steady_clock::now();
+    const auto base = heap_bytes.load();
+    heap_peak = base;
+    for (const auto format : {Format::kJson, Format::kQwen, Format::kDeepSeek})
+      for (const bool strict : {false, true})
+        try {
+          (void)JsonConstraint::ToolParameters(schema, strict, format);
+        } catch (const std::invalid_argument&) {
+          assert(strict);
+        }
+    for (const bool strict : {false, true})
+      try {
+        (void)JsonConstraint::Compile(schema, strict);
+      } catch (const std::invalid_argument&) {
+      }
+    assert(std::chrono::steady_clock::now() - start < kHang);
+    assert(heap_peak.load() - base < 64u << 20);
+  };
+  const auto references = [](const std::string& target, int count) {
+    std::string parts;
+    for (int i = 0; i < count; ++i)
+      parts +=
+          std::string(i ? "," : "") + R"({"$ref":"#/$defs/)" + target + R"("})";
+    return parts;
+  };
+  for (const std::string kind : {"allOf", "anyOf", "oneOf"})
+    for (const int branches : {2, 12, 32})
+      bounded(parse(R"({"type":"object","$defs":{"a":{")" + kind + R"(":[)" +
+                    references("a", branches) +
+                    R"(]}},"properties":{"x":{"$ref":"#/$defs/a"}}})"));
+  constexpr int branches = 16, length = 6;
+  for (const bool through_any_of : {false, true}) {
+    std::string defs;
+    for (int i = 0; i < length; ++i)
+      defs += "\"d" + std::to_string(i) + R"(":{"anyOf":[)" +
+              references("d" + std::to_string(i + 1), branches) + "]},";
+    defs += "\"d" + std::to_string(length) + R"(":{"type":"string"})";
+    const std::string value =
+        through_any_of ? R"({"anyOf":[)" + references("d0", branches) +
+                             R"(],"minLength":1})"
+                       : R"({"$ref":"#/$defs/d0","minLength":1})";
+    const auto schema = parse(
+        R"({"type":"object","$defs":{)" + defs + R"(},"properties":{"x":)" +
+        value + R"(},"required":["x"],"additionalProperties":false})");
+    const auto start = std::chrono::steady_clock::now();
+    const auto base = heap_bytes.load();
+    heap_peak = base;
+    if (!through_any_of)
+      (void)JsonConstraint::ToolParameters(schema, false, Format::kQwen);
+    try {
+      (void)JsonConstraint::Compile(schema, true);
+      assert(false);
+    } catch (const std::invalid_argument& error) {
+      assert(std::string_view(error.what()) ==
+             "JSON Schema: schema intersection exceeds its resource budget");
+    }
+    assert(std::chrono::steady_clock::now() - start < kHang);
+    assert(heap_peak.load() - base < 256u << 20);
+  }
+}
+
 int main(int argc, char** argv) {
+  if (argc == 2 && std::string_view(argv[1]) == "--write-grammar-digests") {
+    TestGrammarDigests(true);
+    return 0;
+  }
   // Batch probes for the independent Python JSON Schema validator. This
   // exercises the production byte matcher without requiring model weights.
   if (argc == 2 && std::string_view(argv[1]) == "--probe") {
@@ -3050,6 +3441,8 @@ int main(int argc, char** argv) {
     }
     return 0;
   }
+  TestGrammarDigests(false);
+  TestRecursiveCombinatorsCompileQuickly();
   TestNestedToolObjectDefaults();
   TestNumberDigitLimits();
   TestObjectMemberOrders();
@@ -3069,6 +3462,8 @@ int main(int argc, char** argv) {
   TestNativeRequestMaskReuse();
   TestReasoningConstraint();
   TestAutomaticTools();
+  TestRequiredTaggedCallLeadingSpace();
+  TestNativeToolRequiredAlternatives();
   TestWideNativeArgumentOrder();
   TestNativeTools();
   TestOpenNativeTools();
@@ -3082,6 +3477,7 @@ int main(int argc, char** argv) {
   TestProviderToolSyntax();
   TestProviderReasoningMarkup();
   TestProviderTaggedSyntax();
+  TestProviderCallListAndKeywordSyntax();
   std::cout << "JSON constraints: language, schema, Unicode and sampler checks "
                "passed\n";
 }

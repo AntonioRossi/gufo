@@ -1,4 +1,6 @@
 #include <chrono>
+#include <gufo/ext/experimental/expert_stream.hpp>
+#include <gufo/ext/host_budget.hpp>
 #include <iostream>
 #include <stdexcept>
 #include <utility>
@@ -104,6 +106,14 @@ std::shared_ptr<ext::TextModelRunner> LoadRunner(
   auto runner = CreateDeepSeekTextRunner(runner_options, &error);
   if (!runner)
     throw std::runtime_error(error);
+  const auto claim = runner->ResourceClaim();
+  if (claim.expert_cache.store) {
+    const std::uint64_t available = gufo::ext::HostAvailableBytes();
+    const std::uint64_t headroom = claim.expert_cache.headroom_bytes;
+    const std::uint64_t grant = available > headroom ? available - headroom : 0;
+    if (!claim.expert_cache.store->Fit(grant))
+      throw std::runtime_error("DeepSeek V4.1 expert-cache fit failed");
+  }
   if (load_start != std::chrono::steady_clock::time_point{}) {
     const auto milliseconds =
         std::chrono::duration_cast<std::chrono::milliseconds>(

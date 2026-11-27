@@ -99,11 +99,15 @@ public:
   [[nodiscard]] bool ExactPrefill() const;
   /// Routed experts stream from the SSD through a bounded cache.
   [[nodiscard]] bool StreamsExperts() const noexcept;
-  /// Re-sizes the streamed expert cache from the memory free now, shrinking it
-  /// or seeding the room left. Call once the sessions exist; pending_bytes is
-  /// memory the caller still allocates later (cache backing that grows).
-  void FitExpertCache(std::uint64_t pending_bytes);
+  /// Fits the streamed expert cache to the host grant, less headroom_bytes.
+  /// Call once the sessions and the long-lived buffers exist. False when the
+  /// fit fails.
+  [[nodiscard]] bool FitExpertCache(std::uint64_t headroom_bytes);
   [[nodiscard]] ds41_expert_cache_status ExpertCacheStatus() const;
+  /// The shared streamed-expert store and its host headroom, for the serving
+  /// resource claim. Null or zero when experts are resident.
+  [[nodiscard]] gufo::expert_stream::Store* ExpertStore() const;
+  [[nodiscard]] std::uint64_t ExpertCacheHeadroom() const;
   /// Routes image positions with the MoE gates' image bias, for image
   /// prompts; enable it before creating sessions.
   [[nodiscard]] bool EnableImageRouting(std::string* error_msg = nullptr);

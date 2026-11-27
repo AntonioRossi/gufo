@@ -6,8 +6,6 @@
     "icu",
     "curl",
     "openssl",
-    "libpng",
-    "libjpeg-turbo",
     "libwebp",
     "opus",
     {"name": "ffmpeg", "default-features": false, "features": ["avcodec", "avformat", "swscale"]},

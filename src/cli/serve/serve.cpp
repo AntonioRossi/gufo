@@ -38,6 +38,7 @@
 #include "src/cli/serve/sampling_request.hpp"
 #include "src/cli/speculative_settings.hpp"
 #include "src/core/diagnostics/gpu_queues.h"
+#include "src/core/diagnostics/linux_sysfs.h"
 #include "src/core/platform/shutdown_signal.hpp"
 #include "src/mem/ledger.hpp"
 
@@ -53,6 +54,30 @@
 namespace gufo::cli {
 namespace {
 
+/// GPU memory at a failed load, after its partial allocations are freed.
+/// On Linux the runtime's free bytes are what the kernel still lets this
+/// process map (GTT, TTM and the system-wide GPU limit, which counts other
+/// processes); with plenty of host memory available, a small value names
+/// another GPU user. On Windows they count only this process's allocations.
+/// GTT counters come from amdgpu sysfs and are absent on Windows.
+std::string GpuMemoryStatus() {
+  std::ostringstream out;
+#if defined(ENGINE_ENABLE_HIP)
+  std::size_t free = 0, total = 0;
+  if (hipMemGetInfo(&free, &total) == hipSuccess) {
+    out << " gpu_device_free_mib=" << free / (1024 * 1024)
+        << " gpu_device_total_mib=" << total / (1024 * 1024);
+  } else {
+    (void)hipGetLastError();
+  }
+#endif
+  if (const auto gtt = diagnostics::LinuxSysfs().QueryGtt()) {
+    out << " gtt_used_mib=" << gtt->used_bytes / (1024 * 1024)
+        << " gtt_total_mib=" << gtt->total_bytes / (1024 * 1024);
+  }
+  return out.str();
+}
+
 class ModelLoadLog {
 public:
   ModelLoadLog(std::string kind, const std::filesystem::path& artifact)
@@ -64,9 +89,9 @@ public:
   ~ModelLoadLog() {
     if (!completed_) {
       try {
-        server::Logger::Error("loader", "event=load_failed kind=" + kind_ +
-                                            " " +
-                                            server::Logger::MemoryStatus());
+        server::Logger::Error(
+            "loader", "event=load_failed kind=" + kind_ + " " +
+                          server::Logger::MemoryStatus() + GpuMemoryStatus());
       } catch (...) {
       }
     }
@@ -960,24 +985,12 @@ int RunServe(std::span<const char* const> args) {
   if (const char* env_host = std::getenv("HOST");
       env_host != nullptr && *env_host != '\0') {
     host = env_host;
-  } else if (const char* env_strix_host = std::getenv("GUFO_HOST");
-             env_strix_host != nullptr && *env_strix_host != '\0') {
-    host = env_strix_host;
   }
 
   int port = 8080;
   if (const char* env_port = std::getenv("PORT");
       env_port != nullptr && *env_port != '\0') {
     const std::string_view sv(env_port);
-    int parsed_port = 0;
-    auto [ptr, ec] =
-        std::from_chars(sv.data(), sv.data() + sv.size(), parsed_port);
-    if (ec == std::errc{} && ptr == sv.data() + sv.size()) {
-      port = parsed_port;
-    }
-  } else if (const char* env_strix_port = std::getenv("GUFO_PORT");
-             env_strix_port != nullptr && *env_strix_port != '\0') {
-    const std::string_view sv(env_strix_port);
     int parsed_port = 0;
     auto [ptr, ec] =
         std::from_chars(sv.data(), sv.data() + sv.size(), parsed_port);
@@ -1787,11 +1800,8 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error: " << exception.what() << '\n';
       return 2;
     }
-    if (speculative_config.backend == server::TextSpeculativeBackend::kDFlash &&
-        dflash_model_path.empty()) {
-      std::cerr << "Error: DFlash2 requires --dflash-model\n";
-      return 2;
-    }
+    // A missing draft model is the runner's to reject: a checkpoint may carry
+    // its own draft.
     speculative_config.draft_model_path =
         speculative_config.backend == server::TextSpeculativeBackend::kDSpark
             ? dspark_model_path
@@ -1805,6 +1815,10 @@ int RunServe(std::span<const char* const> args) {
     std::string err;
     ModelLoadLog load_log("text", model);
     server::TextSpeculativeConfig loaded_speculative = speculative_config;
+    // A provider that declares `serving.hip: false` drives the GPU through its
+    // own runtime, which cannot share the device with HIP in one process: the
+    // server then makes no HIP call at all.
+    bool provider_uses_hip = true;
     backend = std::make_shared<server::InferenceBackend>();
     // The disk snapshot tier is walked during load, which can take minutes.
     // Answer 503 `Loading model` on the port meanwhile, as llama-server does,
@@ -1836,10 +1850,14 @@ int RunServe(std::span<const char* const> args) {
             .model_artifact_fingerprint = {},
         },
         vision_model_path, cache_ram, enable_yarn,
-        [&](const ext::TextProvider& provider, const core::GgufReader&,
+        [&](const ext::TextProvider& provider, const core::GgufReader*,
             ext::TextRunnerOptions* options, std::string* error) {
           try {
             options->provider_options = provider_options.Select(provider.id);
+            for (const auto& info : registry.Providers()) {
+              if (info.id == provider.id)
+                provider_uses_hip = info.uses_hip;
+            }
             ApplySpeculativeSettings(
                 ResolveSpeculativeSettings(provider, speculative_backend, {}),
                 &options->speculative);
@@ -1849,6 +1867,9 @@ int RunServe(std::span<const char* const> args) {
             *error = exception.what();
             return false;
           }
+        },
+        [&loading](double progress, std::string_view message) {
+          loading.SetProgress(progress, message);
         });
     loading.stop();
     if (!load_ok) {
@@ -1904,14 +1925,16 @@ int RunServe(std::span<const char* const> args) {
     }
     load_log.Complete(
         "model=" + backend->model_id() +
-        " sessions=" + std::to_string(session_count) + " context_tokens=" +
-        std::to_string(backend->max_context()) + " speculative=" + speculation +
-        " draft_limit=" + std::to_string(loaded_speculative.max_draft_tokens) +
-        (loaded_speculative.draft_policy.empty()
-             ? std::string()
-             : " draft_policy=" + loaded_speculative.draft_policy) +
-        " disk_cache=" + (cache_disk_directory.empty() ? "off" : "enabled") +
-        served_names);
+            " sessions=" + std::to_string(session_count) +
+            " context_tokens=" + std::to_string(backend->max_context()) +
+            " speculative=" + speculation + " draft_limit=" +
+            std::to_string(loaded_speculative.max_draft_tokens) +
+            (loaded_speculative.draft_policy.empty()
+                 ? std::string()
+                 : " draft_policy=" + loaded_speculative.draft_policy) +
+            " disk_cache=" +
+            (cache_disk_directory.empty() ? "off" : "enabled") + served_names,
+        provider_uses_hip);
   }
 
   // run() joins every request thread, so no hook call outlives it.
@@ -1921,6 +1944,7 @@ int RunServe(std::span<const char* const> args) {
       server::HttpServerOptions{
           .max_request_body_bytes = max_request_body_bytes,
           .max_connections = max_connections,
+          .keep_alive = true,
           .on_device_lost =
               [&device_lost] {
                 device_lost.store(true);

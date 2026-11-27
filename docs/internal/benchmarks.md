@@ -6,6 +6,7 @@ is [benchmarks](../benchmarks.md). Measure release binaries (`nix build`, then
 
 - [DeepSeek V4 Flash](models/deepseek-v4-flash/BENCHMARKS.md)
 - [EmbeddingGemma 2](models/embeddinggemma-2/BENCHMARKS.md)
+- [Inkling 2 Mini](models/inkling-2-mini/BENCHMARKS.md)
 - [MiniMax H3](models/minimax-h3/BENCHMARKS.md)
 - [Qwen-Image-2.1](models/qwen-image-2.1/BENCHMARKS.md)
 - [Qwen3.8 27B](models/qwen3.8-27b/BENCHMARKS.md)
@@ -17,7 +18,7 @@ is [benchmarks](../benchmarks.md). Measure release binaries (`nix build`, then
 
 `tools/bench/model-bench.py` measures the tables of a model's `BENCHMARKS.md`
 over HTTP for Gufo and for the reference project of its category (llama.cpp
-for Qwen; antirez/ds4 for DeepSeek), writes per-table artifacts, and renders the tables
+for Qwen and Inkling; antirez/ds4 for DeepSeek), writes per-table artifacts, and renders the tables
 and SVG charts between the `<!-- bench:<id> -->` markers. Workloads and table
 layouts are declared in `docs/internal/models/<model>/artifacts/bench.json`; the
 `benchmark-model` skill in `.agents/skills` describes the procedure.
@@ -30,6 +31,7 @@ the normal development shell and hosted checks:
 | Qwen AR / DFlash2 | `.#llama-cpp-reference` | `llama-server` |
 | Flash-Next MTP | `.#llama-cpp-mtp-reference` | `llama-server-mtp` |
 | DeepSeek AR / DSpark | `.#ds4-reference` | `ds4-server`, `ds4-bench` |
+| Inkling 2 Mini AR | none yet: a llama.cpp `4c92c5bfb` ROCm build, passed with `--reference-binary` | `llama-server` |
 
 For example, enter the development shell and add only the needed baseline:
 
@@ -85,6 +87,20 @@ server-stage metrics remain null. `--reference-report` compares completion
 hashes against an existing C1 reference; category filters select a focused
 subset. Qualify acceptance with a fresh server so prompt-cache hits do not
 hide work. See [serving benchmark commands](performance.md) for invocation.
+
+`tools/serving/gufo-interface-bench.py` measures the serving interface rather
+than the model. It speaks raw HTTP/1.1 to report connect, first response byte,
+first SSE event, client TTFT, inter-token gaps with p99 and >10/30/100 ms
+counts, events and bytes per read, and the delta between client TTFT and the
+server's `usage.gufo.ttft_ms`. That server clock runs from backend entry to
+the first selected token, so the delta also holds request parsing, admission
+and SSE emission. A small overhead request compares fresh and reused
+connections; each stream opens its own. A client-visible stall can then be
+attributed to the interface before it is treated as a model regression. It
+uses the serving benchmark's prompt, sampling, cache policy and concurrency
+levels. The artifact records the served model ID, the source revision and a
+prompt SHA-256, and omits hosts, base paths, prompts, generated text, token
+IDs and timestamps.
 
 `tools/bench/speculative-corpus.py` compares direct autoregressive and
 speculative token traces. Request correctness, acceptance, and end-to-end

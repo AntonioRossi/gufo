@@ -7,6 +7,7 @@
 #include <exception>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -36,6 +37,9 @@
 namespace gufo::mem {
 class StateAccount;
 }  // namespace gufo::mem
+namespace gufo::expert_stream {
+class Store;
+}  // namespace gufo::expert_stream
 
 namespace gufo::ext {
 
@@ -54,6 +58,13 @@ struct TextPromptContext {
       std::size_t token_count) const {
     return PrefixInputIdentity(cache_identity, cache_prefixes, token_count);
   }
+  /// True when the context stays correct for any tokenization of the same
+  /// prompt text: no token positions, input rows or prepared handles. The
+  /// host may then rewrite a replayed answer to the tokens a live frontier
+  /// sampled for that text (#1154), as for a request without a context. A
+  /// context with cache inputs is never rewritten. The default keeps the
+  /// rendered tokens.
+  [[nodiscard]] virtual bool TokenizationIndependent() const { return false; }
   /// Moves a candidate prefill stop, a token count, to a position where
   /// prefill may end: the nearest legal one at or before `position`, or at or
   /// after it when `up`. A model whose input rows must be evaluated in one
@@ -195,6 +206,26 @@ struct TextRunnerDescriptor {
   TextSchedulingProfile scheduling{};
 };
 
+/// Experimental: a runner that streams mixture-of-experts weights through
+/// `expert_stream::Store` lets serving size its expert cache together with
+/// the prompt cache. Once the sessions and the prompt cache's backing exist,
+/// serving grants the store what it holds plus the host memory available,
+/// less `headroom_bytes` and the prompt-cache budget still to commit, and
+/// calls `Store::Fit` with it.
+struct TextRunnerExpertCacheClaim {
+  /// The store to size; it must outlive the runner's sessions. Null: the
+  /// runner does not stream experts and the other fields are ignored.
+  expert_stream::Store* store{nullptr};
+  /// Host memory left free after the expert cache: buffers the first prompt
+  /// still allocates, transient prefill peaks and margin against swap.
+  std::size_t headroom_bytes{0};
+  /// The automatic RAM prompt-cache budget per session while experts stream:
+  /// it bounds `retained_snapshot_capacity_bytes` times the sessions. An
+  /// explicit --cache-ram-bytes replaces it. Missing keeps the automatic
+  /// budget as without streaming.
+  std::optional<std::size_t> prompt_cache_share_per_session_bytes;
+};
+
 struct TextRunnerResourceClaim {
   std::optional<std::size_t> resident_weights_bytes;
   std::optional<std::size_t> state_capacity_bytes;
@@ -219,10 +250,29 @@ struct TextRunnerResourceClaim {
   /// sessions do not all fit at full context, the host lets them share this
   /// memory instead of refusing the configuration (mem::FitSessions), and
   /// admits each request against its own tokens. Missing or zero keeps the
-  /// full-context check. Declared last, so positional initializers of the
-  /// earlier fields keep their meaning.
+  /// full-context check. Declared after the fields above, so their
+  /// positional initializers keep their meaning.
   std::optional<std::size_t> demand_mapped_state_bytes;
+  /// Experimental: the expert cache serving sizes with the prompt cache.
+  /// Declared last for the same reason.
+  TextRunnerExpertCacheClaim expert_cache{};
 };
+
+/// The automatic RAM prompt-cache budget the claim allows for `sessions`:
+/// `retained_snapshot_capacity_bytes`, bounded by the expert-cache claim's
+/// share per session when it streams experts.
+[[nodiscard]] inline std::size_t AutomaticRetainedBytes(
+    const TextRunnerResourceClaim& claim, std::size_t sessions) {
+  const auto measured = claim.retained_snapshot_capacity_bytes.value_or(0);
+  const auto& experts = claim.expert_cache;
+  if (!experts.store || !experts.prompt_cache_share_per_session_bytes)
+    return measured;
+  const auto share = *experts.prompt_cache_share_per_session_bytes;
+  const auto most = std::numeric_limits<std::size_t>::max();
+  const auto total =
+      sessions && share > most / sessions ? most : share * sessions;
+  return std::min(measured, total);
+}
 
 struct TextRunnerMeasuredResources {
   std::optional<std::size_t> per_request_state_bytes;
@@ -406,6 +456,22 @@ struct ChatMessage {
   };
   std::vector<ImagePart> images;
 
+  /// The text and thought parts in the order the client sent them, when that
+  /// order says more than `thought` followed by `content`: several text parts
+  /// (each its own block in templates that render parts as blocks), or a
+  /// thought after text, as a turn written as blocks replays it. A text part
+  /// ends at `end` bytes of `content`, a thought part at `end` bytes of
+  /// `thought`; ends grow, and the last of each kind is that string's size.
+  /// Images keep their content offsets. Empty: the legacy order. `content`
+  /// and `thought` hold the parts joined, so a renderer may ignore this.
+  struct Part {
+    bool thought{false};
+    std::size_t end{0};
+
+    friend bool operator==(const Part&, const Part&) = default;
+  };
+  std::vector<Part> parts;
+
   struct ToolArgument {
     std::string name;
     std::string value;
@@ -504,6 +570,17 @@ public:
   /// `close`. `open` must not begin with whitespace, which parsers skip.
   using ReasoningMarkup = ext::ReasoningMarkup;
   [[nodiscard]] virtual ReasoningMarkup ReasoningDelimiters() const;
+  /// For a runner that publishes ToolDialectId() and ReasoningDelimiters()
+  /// markup but whose model writes another spelling: the spelling grammars
+  /// must constrain. std::nullopt (the default) uses the published one.
+  [[nodiscard]] virtual std::optional<sampling::JsonConstraint::ToolSyntax>
+  ToolGrammarSyntax(const ChatRequest&) const {
+    return std::nullopt;
+  }
+  [[nodiscard]] virtual std::optional<ReasoningMarkup> ReasoningGrammarMarkers(
+      const ChatRequest&) const {
+    return std::nullopt;
+  }
   [[nodiscard]] virtual std::uint32_t VocabularySize() const { return 0; }
   [[nodiscard]] std::shared_ptr<const sampling::ReasoningBudget>
   BuildReasoningBudget(std::size_t tokens,
@@ -976,6 +1053,10 @@ struct TextProvider {
 void RegisterTextProvider(TextProvider provider);
 const TextProvider* FindTextProvider(std::string_view id);
 const TextProvider* ProbeTextProvider(std::string_view model_root);
+/// For a directory path: sets `*provider` to the provider with a runner whose
+/// `probe` accepts it (or null) and returns true. False for any other path.
+bool ProbeModelDirectory(const std::string& path,
+                         const TextProvider** provider);
 /// The first provider whose `probe_gguf` accepts `reader`, skipping providers
 /// without `accepts_unsized_tensors` when the file has unsized tensors.
 const TextProvider* ProbeTextProvider(const core::GgufReader& reader);

@@ -41,18 +41,8 @@ struct Execution {
       idle.push_back(std::move(session));
     }
     // Every selected session and its long-lived buffers exist before the
-    // shared cache fit. Generation starts only after this returns.
-    model->FitExpertCache(0);
-    const auto cache = model->ExpertCacheStatus();
-    if (cache.enabled) {
-      gufo::server::Logger::LogFormatted(
-          gufo::server::LogLevel::kInfo, "ds41",
-          "event=expert_streaming stream_experts=true expert_cache_bytes=%llu "
-          "cache_bytes=%llu cache_limit_bytes=%llu",
-          static_cast<unsigned long long>(cache.requested_bytes),
-          static_cast<unsigned long long>(cache.allocated_bytes),
-          static_cast<unsigned long long>(cache.limit_bytes));
-    }
+    // host or the standalone caller fits the expert cache. Generation
+    // starts only after this returns.
   }
 };
 
@@ -139,6 +129,9 @@ public:
     claim.retained_snapshot_capacity_bytes = ext::HostSnapshotBudgetBytes();
     claim.retained_snapshot_ceiling_bytes = ext::HostSnapshotCeilingBytes();
     claim.requires_device_runtime_lock = true;
+    claim.expert_cache.store = execution_->model->ExpertStore();
+    claim.expert_cache.headroom_bytes =
+        execution_->model->ExpertCacheHeadroom();
     return claim;
   }
 

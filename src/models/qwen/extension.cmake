@@ -16,7 +16,6 @@ gufo_extension_target(
     modules/quant_gemm.cpp
     modules/residual.cpp
     modules/rope.cpp
-    modules/sample.cpp
     modules/ssm.cpp
     modules/unembed.cpp
     generator.cpp
@@ -69,9 +68,7 @@ gufo_extension_target(
   LINK_LIBRARIES
     gufo_qwen
     gufo_cache_hip
-    gufo_qwen_kernels
-    gufo_qwen_vision
-    gufo_qwen_draft_vocab
+    gufo::qwen_family
     gufo_compare
     hip::host
 )

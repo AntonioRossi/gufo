@@ -787,9 +787,9 @@ cache::Completion ContinuationAdapter::LoadPrivatePiece(
         std::memcpy(static_cast<std::byte*>(target) + offset, bytes.data(),
                     bytes.size());
       else
-        Check(hip::CopySnapshotToDevice(
-            static_cast<std::byte*>(target) + offset, bytes.data(),
-            bytes.size(), transfer.Native()));
+        Check(
+            hip::CopySnapshotToDevice(static_cast<std::byte*>(target) + offset,
+                                      bytes.data(), bytes.size(), transfer));
     });
   } catch (...) {
     state.failed = true;
@@ -885,7 +885,7 @@ cache::Completion ContinuationAdapter::TransferRows(
     if (policy_.UsesFp16AttentionKv()) {
       auto* device = native + first * row;
       Check(load ? hip::CopySnapshotToDevice(device, bytes, (end - first) * row,
-                                             transfer.Native())
+                                             transfer)
                  : hip::CopySnapshotToHost(bytes, device, (end - first) * row,
                                            transfer.Native()));
     } else {
@@ -894,10 +894,9 @@ cache::Completion ContinuationAdapter::TransferRows(
         auto* device =
             native + (head * std::size_t{context_} + first) * head_bytes;
         auto* host = bytes + head * head_bytes;
-        Check(hipMemcpy2DAsync(load ? device : host, load ? head_bytes : row,
-                               load ? host : device, load ? row : head_bytes,
-                               head_bytes, end - first, direction,
-                               transfer.Native()));
+        hip::CopyKvRows(load ? device : host, load ? head_bytes : row,
+                        load ? host : device, load ? row : head_bytes,
+                        head_bytes, end - first, direction, transfer.Native());
       }
     }
   });

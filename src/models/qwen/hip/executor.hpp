@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <exception>
 #include <functional>
+#include <gufo/ext/families/qwen/text/tokenizer.hpp>
 #include <gufo/ext/model_config.hpp>
 #include <memory>
 #include <optional>
@@ -16,7 +17,6 @@
 #include <vector>
 
 #include "src/families/qwen/hip_common/continuation_hooks.hpp"
-#include "src/families/qwen/text/tokenizer.hpp"
 #include "src/models/qwen/forward.hpp"
 #include "src/models/qwen/generator.hpp"
 #include "src/models/qwen/state.hpp"
@@ -28,12 +28,12 @@
 
 #include <gufo/ext/experimental/hip_graph_decode_executor.hpp>
 #include <gufo/ext/experimental/state_memory.hpp>
+#include <gufo/ext/families/qwen/kernels/ops/token.hpp>
+#include <gufo/ext/families/qwen/vision/device_input.hpp>
 
 #include "src/families/qwen/hip_common/execution_policy.hpp"
 #include "src/families/qwen/kernels/ops/gemm.hpp"
 #include "src/families/qwen/kernels/ops/ssm.hpp"
-#include "src/families/qwen/kernels/ops/token.hpp"
-#include "src/families/qwen/vision/device_input.hpp"
 #include "src/models/qwen/hip/prompt_hidden_buffer.hpp"
 
 namespace gufo::hip {
@@ -254,6 +254,11 @@ template<typename T>
   return pointer == nullptr ? nullptr : pointer + offset;
 }
 
+/// Queue a pitched Qwen KV transfer within each operand's backing pages.
+void CopyKvRows(void* destination, std::size_t dst_pitch, const void* source,
+                std::size_t src_pitch, std::size_t width, std::size_t rows,
+                hipMemcpyKind kind, hipStream_t stream);
+
 /// Preallocated, zero-allocation GPU execution arena on gfx1151.
 class QwenGpuArena {
 public:
@@ -374,8 +379,16 @@ public:
       QwenExecutionPolicy policy = QwenExecutionPolicy::Production());
   [[nodiscard]] static std::size_t RecurrentStateBytes(
       const core::ModelConfig& config, QwenExecutionPolicy policy);
-  /// Attention K/V bytes at `max_context`: the demand-mapped part of
-  /// EstimateMemoryUsage().
+  /// The state of one arena the core allocates (mem::SessionState): the
+  /// attention K/V, one region whose segments are FP16 planes
+  /// [layer][position][width] or FP32 planes [layer][head][position][dim],
+  /// buffer 0. Recurrent state stays the arena's own: it swaps between two
+  /// buffers for replay (RecurrentStateBytes).
+  [[nodiscard]] static gufo::mem::StateDeclaration DeclareState(
+      const core::ModelConfig& config, std::uint32_t max_context,
+      QwenExecutionPolicy policy);
+  /// Attention K/V bytes at `max_context` (DeclareState): the demand-mapped
+  /// part of EstimateMemoryUsage().
   [[nodiscard]] static std::size_t KvBytes(const core::ModelConfig& config,
                                            std::uint32_t max_context,
                                            QwenExecutionPolicy policy);
@@ -412,6 +425,8 @@ private:
   [[nodiscard]] bool AllocateSsmReplayLog();
 
   core::ModelConfig config_;
+  /// The declared state (DeclareState); account_ and kv_region_ are its.
+  std::unique_ptr<gufo::mem::SessionState> state_;
   std::shared_ptr<gufo::mem::StateAccount> account_;
   std::shared_ptr<gufo::mem::Region> kv_region_;
   std::uint32_t max_context_;

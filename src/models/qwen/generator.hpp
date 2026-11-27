@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <gufo/ext/families/qwen/text/tokenizer.hpp>
 #include <gufo/ext/gguf_reader.hpp>
 #include <gufo/ext/sampling.hpp>
 #include <memory>
@@ -12,7 +13,6 @@
 #include <string>
 #include <vector>
 
-#include "src/families/qwen/text/tokenizer.hpp"
 #include "src/models/qwen/forward.hpp"
 #include "src/models/qwen/state.hpp"
 
@@ -43,10 +43,6 @@ public:
       const GenerationOptions& options,
       const std::function<bool(tokenization::TokenId, std::string_view)>&
           on_token = nullptr);
-
-  /// Helper to generate from raw text prompt.
-  [[nodiscard]] std::string GenerateText(std::string_view prompt,
-                                         const GenerationOptions& options = {});
 
   [[nodiscard]] const tokenization::QwenTokenizer& GetTokenizer()
       const noexcept {

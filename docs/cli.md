@@ -49,7 +49,7 @@ These server options work with every modality:
 | --- | --- | --- |
 | `--host`, `-i` | `127.0.0.1` | Address to listen on. Use `0.0.0.0` inside a container, or `::` for IPv6 and IPv4. |
 | `--port`, `-p` | `8080` | Port to listen on. |
-| `--max-connections` | 16 | Open HTTP connections; more wait or are refused. |
+| `--max-connections` | 16 | HTTP connections serving a request; more are refused. Idle kept-alive connections are closed to admit new ones. |
 | `--max-request-bytes` | 8 MiB | Largest request body. Raise it for audio and image uploads. |
 | `--log-level` | `info` | `error`, `warn`, `info` or `debug`; `-v` means `debug`. |
 | `--served-model-name` | per model | The model ID clients send. Repeat it to accept aliases. |
@@ -64,6 +64,7 @@ These server options work with every modality:
 **Model and memory**
 
 - `--model`, `-m`: the GGUF file. For sharded files, pass the first shard.
+  An extension's provider can also accept a model directory.
 - `--context`, `-c`: tokens per request. The default is the model's native
   context; lower it to fit more sessions in memory.
 - `--sessions`, `-j` (server only): requests that compute at the same time,
@@ -106,7 +107,8 @@ the same distribution.
 - `--speculative`: `off`, or the mode a model offers: `dflash2`
   ([Qwen3.8 27B](models/qwen3.8-27b.md)), `mtp`
   ([Qwen3.8 Flash-Next](models/qwen3.8-flash-next.md)), `dspark`
-  ([DeepSeek V4 Flash](models/deepseek-v4-flash.md)).
+  ([DeepSeek V4 Flash](models/deepseek-v4-flash.md),
+  [Inkling 2 Mini](models/inkling-2-mini.md)).
 - `--dflash-model`, `--mtp-model`, `--dspark-model`: the draft file.
 - `--draft-tokens`, `--min-draft-tokens`, `--draft-policy`: deprecated and
   ignored; they will be removed. Each model sets how many tokens it proposes.

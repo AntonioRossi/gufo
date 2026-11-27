@@ -64,7 +64,8 @@ video generation or duplicate suites for routine edits. A missing-model skip
 is not a quality pass. Broaden checks when shared behavior changes or failures
 expose risk.
 
-Text API functional/regression tests live in [tests/functional/](tests/functional/README.md).
+Text API functional/regression tests live in [tests/functional/](tests/functional/README.md);
+follow [tests/functional/AGENTS.md](tests/functional/AGENTS.md) when adding or changing them.
 Select suites explicitly. Model-specific changes need the affected model/modes;
 use all four profiles only for shared behavior changes. Run correctness on the
 candidate; use main for matched affected timing controls and suspected regressions,
@@ -121,6 +122,9 @@ quality; successful optimizations become the default, without extra switches.
   forwarded core/cache headers), the metadata schema and public CMake contracts
   require an `ext-api` PR label and one new, uniquely named Markdown record under
   `include/gufo/ext/changes/<major>.<minor>/` when declarations/contracts change.
+  Paths reachable only through the no-promise `experimental/` and `families/`
+  headers (generated `include/gufo/ext/NO_PROMISE`) stay in `SURFACE` and the
+  build ID but need no label or record; shared paths keep the rule.
   Records are permanent and immutable. CMake derives the API revision from the
   active series in `include/gufo/ext/api-series.json` plus its revision-record
   count. The `baseline.md` record documents the initial contracts without advancing

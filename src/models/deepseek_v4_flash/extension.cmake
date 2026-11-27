@@ -43,9 +43,7 @@ if (ENGINE_ENABLE_HIP)
   set(DEEPSEEK_V4_FLASH_MMQ_SOURCES
     ${DEEPSEEK_V4_FLASH_MMQ_DIR}/ds4_ggml_stubs.hip.cpp
     ${DEEPSEEK_V4_FLASH_MMQ_DIR}/ds4_mmq.hip.cpp
-    ${DEEPSEEK_V4_FLASH_MMQ_DIR}/ds4_mmq_d2r.hip.cpp
     ${DEEPSEEK_V4_FLASH_MMQ_DIR}/mmid.hip.cpp
-    ${DEEPSEEK_V4_FLASH_MMQ_DIR}/mmvq.hip.cpp
     ${DEEPSEEK_V4_FLASH_MMQ_DIR}/quantize.hip.cpp)
 
   add_library(gufo_deepseek_v4_flash_mmq STATIC
@@ -61,7 +59,7 @@ if (ENGINE_ENABLE_HIP)
     GGML_HIP_NO_VMM
     DS4_ROCM_WMMA_MMQ_Y=64)
   target_compile_options(gufo_deepseek_v4_flash_mmq PRIVATE
-    $<$<COMPILE_LANGUAGE:HIP>:-O3;${GUFO_CLANG_OPTION}-ffast-math;${GUFO_CLANG_OPTION}-fno-finite-math-only;-Wno-unused-value;-Wno-unused-command-line-argument>)
+    $<$<COMPILE_LANGUAGE:HIP>:${GUFO_CLANG_OPTION}-O3;${GUFO_CLANG_OPTION}-ffast-math;${GUFO_CLANG_OPTION}-fno-finite-math-only;-Wno-unused-value;-Wno-unused-command-line-argument>)
   target_include_directories(gufo_deepseek_v4_flash_mmq SYSTEM PUBLIC
     ${DEEPSEEK_V4_FLASH_MMQ_DIR})
   target_link_libraries(gufo_deepseek_v4_flash_mmq PUBLIC
@@ -105,7 +103,7 @@ if(TARGET gufo_deepseek_v4_flash_hip)
     DS4_ROCM_BUILD=1)
   target_compile_options(gufo_deepseek_v4_flash_hip PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-O3;${GUFO_CLANG_OPTION}-ffast-math;${GUFO_CLANG_OPTION}-fno-finite-math-only>
-    $<$<COMPILE_LANGUAGE:HIP>:-O3;${GUFO_CLANG_OPTION}-ffast-math;${GUFO_CLANG_OPTION}-fno-finite-math-only;-Wno-unused-command-line-argument>)
+    $<$<COMPILE_LANGUAGE:HIP>:${GUFO_CLANG_OPTION}-O3;${GUFO_CLANG_OPTION}-ffast-math;${GUFO_CLANG_OPTION}-fno-finite-math-only;-Wno-unused-command-line-argument>)
   target_include_directories(gufo_deepseek_v4_flash_hip PUBLIC
     ${PROJECT_SOURCE_DIR}
     ${GUFO_EXTENSION_BUILD_ROOT}

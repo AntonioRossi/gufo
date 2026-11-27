@@ -66,12 +66,31 @@ configured `rustc` reports for its standard library. The C++
 sanitizer preset does not instrument the Rust library; it uses the development
 profile when configured as Debug.
 
-`png_decode_test` checks expected RGB bytes across color types, sample depths,
-transparency, Adam7 interlacing and EXIF orientations. It fixes the PNG port's intentional framing
-behavior: missing Adler trailers and unknown non-letter chunks are accepted;
-bad IEND CRCs, nonempty IEND and stray IDAT after text are rejected.
-APNG metadata is ignored while decoding the default image. Libpng only
-writes fixtures; no frozen decoder remains.
+`png_test` checks expected RGB and RGBA bytes across color types, sample
+depths, transparency, Adam7 interlacing, filters and EXIF orientations, and
+encoder round trips. Its RGBA gamma, sBIT and chunk-precedence values were
+recorded from libpng 1.6.59's simplified API (`png_image_begin_read_from_memory`
+and `png_image_finish_read` with `PNG_FORMAT_RGBA`, from
+`nix shell nixpkgs#libpng`); re-record them the same way after changing the
+RGBA conversion.
+It fixes the PNG port's intentional framing behavior: missing Adler trailers
+and unknown non-letter chunks are accepted; bad IEND CRCs, nonempty IEND and
+stray IDAT after text are rejected. APNG metadata is ignored while decoding
+the default image. The test writes its own fixtures with stored deflate
+blocks; no frozen decoder remains.
+
+`jpeg_decode_test` decodes the JPEG fixtures in `tests/fixtures/jpeg`, which
+libjpeg-turbo wrote once: gray, YCbCr from 4:4:4 to 4:1:0, RGB, CMYK and YCCK,
+baseline, progressive, optimized, restart intervals and qualities 1 and 100,
+at sizes that end inside an MCU. Each must decode to its recorded size and
+pixel digest, and stay within 6 of libjpeg-turbo's pixels at three recorded
+points; the border of an image with subsampled chroma may differ by 40. From
+the fixtures the test derives metadata segments and EXIF orientations, which
+must give the plain fixture's pixels, reoriented, and framing errors,
+truncations and bit flips, each with its recorded outcome. Arithmetic coding, lossless JPEG, DNL markers,
+scans that end early and an AC run past coefficient 63 are listed differences
+from libjpeg-turbo, each with the outcome the Rust decoder must return.
+`jpeg_decode_test --corpus DIR... [--repeat N]` decodes and times real photos.
 
 `wav_decode_test` checks PCM16 values, the strict caller's status mapping,
 truncation and limits, and propagation of C++ callback exceptions. Rust WAV
@@ -84,7 +103,8 @@ on generated audio: the float value of each WAV encoding (8- to 32-bit PCM,
 mu-law value and `WAVE_FORMAT_EXTENSIBLE` on `kAll`, the strict path's float
 clamping, the channel mean, also while decoding (`downmix_mono`), sines through the resampler from 8 to 192 kHz to 16 and 48 kHz
 (passband error below 1e-4, stopband rms below 1e-5, soxr's output length),
-small Ogg Opus and MP3 fixtures, and the status of each rejection. It runs in
+small Ogg Opus, live WebM Opus and MP3 fixtures, and the status of each
+rejection. It runs in
 `check-pr`. The resampler and audio decoder crates also have Rust unit tests
 covered by the workspace command above.
 The decoder's tests compare its direct WAV sample conversion with symphonia's
@@ -106,42 +126,104 @@ no control bytes in targets or values, a 100-field limit, bare LF line ends
 and one leading empty line. Rust tests also check query parameters, header
 lists and caller errors. `http_server_test` checks parsing over a socket.
 
-`multipart_test` compares the Rust multipart parser, with each API's limits,
-with frozen copies of the three 0.33.0 parsers in
-`tests/cli/multipart_reference.cpp`. Forms as clients encode them must give
-every API the same fields, also when the API stops after one of the first
-fields; error messages may differ, and other forms, which RFC 7578 may read
-differently, are counted, not compared. The forms cover client-style
-boundaries, names, filenames and contents, up to 34 fields, forms with what
-clients do not send, and random mutations; the forms captured from curl,
-Python requests, Node.js and Go in `tests/fixtures/multipart` must be among
-the canonical ones and parse completely. Every rejection the parser has must be
-reached. It runs in `check-pr`; the parser's Rust unit tests check the RFC
-rules for the other forms.
+`multipart_test` checks `ParseMultipart` with each API's limits: the forms
+captured from curl, Python requests, Node.js and Go in
+`tests/fixtures/multipart` give their exact fields, also when the API stops
+after one of the first three, and unique names reject the repeated `image[]`.
+Every status and message the parser returns, each API's field limit and a
+field consumer's exception are checked too, and a comment lists where 0.33.0
+read forms differently. It runs in `check-pr`; the parser's Rust unit tests
+check the RFC rules and the C ABI.
 
 `websocket_frame_test` checks expected queued messages and reply frames through
 the C ABI: fragments, pings, close codes, UTF-8, length encodings, truncation
 and queue limits. Rust tests cover protocol rejections and buffer reuse;
 `audio_websocket_test` covers sockets. All three parser caller tests run in
-`check-pr`. The frozen C++ decoders were retired after their ports shipped in
-v0.34.0 or earlier. The audio decoder has no frozen C++ oracle; its independent
+`check-pr`. The frozen C++ decoders and multipart parsers were retired after
+their ports shipped in v0.34.0 or earlier. The audio decoder has no frozen C++ oracle; its independent
 symphonia PCM and numerical resampler checks remain.
 
-`gguf_header_test` compares the Rust GGUF header parser, through
-`GgufReader::OpenMemory`, with a frozen copy of the 0.35.0 C++ parser in
-`tests/core/gguf_header_reference.cpp`. Generated headers cover every metadata
-value and array item type, alignments, tensor ranks, known and unknown storage
-types, unsized tensors and data layouts; deterministic mutations truncate, flip,
-overwrite, insert and erase bytes; further headers hold arrays around the
-parser's block size and fill each charge of the descriptor budget to its last
-byte and one byte past it. Each must open with the same version, alignment,
-metadata and tensors, whose strings and data point at the same bytes, or fail
-with the same message, with and without `allow_unsized_tensors`. Only a header
-over the descriptor budget fails with its own message, which names the limit
-where 0.35.0 reported a malformed or over-long entry. Every rejection must be
-reached. GGUF files given as arguments are compared and timed too. It
-runs in `check-pr`; the crate's Rust tests cover the check order, the budget and
-the C ABI.
+`gguf_header_test` checks the Rust GGUF header parser through its C++ caller,
+`GgufReader::OpenMemory`, with expected results: every metadata value type as
+the C++ variant holds it, strings that point into the parsed bytes, arrays of
+every item type around the parser's block size, versions, alignments, sized
+and unsized tensors, and the exact message of every rejection. Headers fill
+each charge of the descriptor budget to its last byte and one byte past it;
+the overrun names the limit, where 0.35.0 reported a malformed or over-long
+entry. Truncations and byte changes must fail with a known message or open
+tensors inside the buffer. GGUF files given as arguments must open and are
+timed. It runs in `check-pr`; the crate's Rust tests cover the check order,
+the budget and the C ABI.
+
+`safetensors_header_test` compares the Rust safetensors header reader, through
+`safetensors::Parse`, with frozen copies of the six 0.35.0 C++ parsers it
+replaced in `tests/core/safetensors_reference.hpp`: LoRA, EmbeddingGemma 2,
+Qwen3-ASR, Qwen3-TTS, Qwen-Image and MiniMax H3, whose own JSON number rules
+are rebuilt on the core parser. Headers from a grid of types, shapes and
+offsets, metadata, length fields, the layouts of three tensors and tensors
+without elements among them, every truncation of four files and their
+deterministic mutations must give each loader the tensors its old parser gave. A file the reader rejects that an old
+parser accepted must break one of the stricter rules that loader takes on, which
+the test confirms from the header itself; any other difference fails. Accepted
+headers are checked against the rules independently. It runs in `check-pr`; the
+crate's Rust tests cover each rule, the check order and the C ABI.
+
+`json_parse_test` checks expected values, number tokens and member order, or
+the message of each of the parser's 21 rejections, through `json::parse`:
+whitespace and trailing input, NUL bytes, duplicate keys compared decoded,
+number spellings, ranges and rounding (subnormals, results that round to zero
+or overflow, halfway cases decided after 768 digits), escapes, surrogates and
+ill-formed UTF-8, the depth limit of 128, a 1 MiB string with bad bytes
+inserted and objects of 5,000 keys. Every allocation of the C++ builder is
+failed once, for a value and for a rejection: its exception must reach the
+caller. It runs in `check-pr`; the crate's Rust tests cover the integer fast
+path, the string scan, the switch to a key set, long mantissas that offset
+large exponents, failed allocations and the C ABI.
+
+`json_schema_test` checks expected results of the Rust JSON Schema compiler
+through its C++ callers: `JsonSchemaRegex` with ICU's sets, the string and
+number lexemes, `IntersectMultipleOf` and `Format`. Patterns must accept, keep
+alive or reject listed texts: ECMAScript classes and escapes, Unicode
+properties, properties of strings such as `\p{RGI_Emoji_Flag_Sequence}`,
+ill-formed UTF-8 read as U+FFFD, assertions, length bounds with their
+`MaximumSuffix`, and `CanFinish` and `CanAdvance` far beyond the states.
+Rejections and the size, nesting, repetition and state limits must give their
+exception and message. String schemas check lengths in codepoints, escapes,
+patterns, formats and canonical mask states; number schemas check bounds,
+exclusivity, `multipleOf`, the plain-decimal spelling and `AcceptValue`. It
+runs in `check-pr`; the crate's Rust tests cover the decimal arithmetic, the
+keywords, a few languages and rejections, and the C ABI.
+
+`chat_request_test` checks the Rust chat request decoder
+(`src/core/chat_request`) through its C++ caller,
+`src/cli/serve/chat_request.cpp`, and the three fragment shims
+`openai_chat_test` calls. A fake environment serves fixed model names, fails
+chosen image URLs, rejects chosen schemas and logs every call. Chat
+Completions, Responses and Messages bodies with every field the decoder reads,
+and one rejection per kind (parse errors, models, messages, images, tools,
+tool choices, reasoning, limits, sampling, stop and format fields, and the
+compatibility check), must give the expected request or rejection (status,
+code and message) and log, under three server settings. A rejected fragment
+leaves its request unchanged, where the 0.35.0 C++ decoders, retired after
+the port shipped in v0.37.0, filled part of it. It runs in `check-pr`; the
+crate's Rust tests cover the check order, the body view the C++ helpers get,
+the C ABI and, under a failing allocator, `NO_MEMORY` instead of an abort for
+copies of large values.
+
+`cache_disk_manifest_test` checks the Rust disk manifest codec and CRC-64
+(`src/core/cache_manifest`), through `src/cache/disk.hpp`, with expected
+results. Manifests with row, window and private-state components encode to the
+0.35.0 bytes under format version 2 or 3, pinned by length, header and
+checksum trailer, and decode to the same fields with capacities that match the
+metadata plan the store charges. Each limit is reached and exceeded: 2 Mi
+tokens, 64 KiB of input, 256 components and 65,536 payload references.
+Incoherent manifests and damaged, re-signed or relabelled bytes throw
+`std::invalid_argument`; the plan rejects only broken structure, not a wrong
+checksum, magic or version. Checksums match recorded CRC-64/ECMA-182 values
+around both checksum paths and chain through their seed. It runs in
+`check-pr`; the crate's Rust tests cover validation, every truncation and bit
+flip, both checksum paths against a bitwise definition, the callbacks and the
+C ABI. `cache_disk_test` checks the store around it.
 
 The hosted Rust check uses Cargo's default test profile, with overflow checks
 and debug assertions enabled. The Windows job builds the Rust library and C++

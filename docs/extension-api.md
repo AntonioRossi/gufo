@@ -15,14 +15,14 @@ prints the exact version.
   any later 0.2 revision.
 - A **minor** bump may break extensions. The minor in your `api_version` must
   equal the host's, so `">= 0.1.12"` doesn't build against 0.2.
-- Headers under `include/gufo/ext/experimental/` carry no promise; check them
-  whenever you update.
+- Headers under `include/gufo/ext/experimental/` and `families/`, and what only
+  they include, carry no promise and change without a record; check them when
+  you update. Family headers reach no model and models no other model; a model
+  forwards only to its directory in `MODEL_SOURCES` (check-extension-api.py).
 
 The promise is source compatibility: rebuild against a new Gufo and your
 extension compiles. Binaries built for one Gufo don't load into another.
-
-Every change to the API adds a record under
-[`include/gufo/ext/changes/`](../include/gufo/ext/changes/README.md), and the
+Every change to the API adds a record under [`include/gufo/ext/changes/`](../include/gufo/ext/changes/README.md), and the
 revision is the number of records, so the records are the changelog.
 
 ## The boundary
@@ -40,6 +40,23 @@ uses:
 | `gufo_ext_core` | GGUF reading, sampling, JSON constraints, dequantization, SHA-256, image decoding, hipBLASLt plans and, with HIP, `WeightUpload` | all |
 | `gufo_ext_cache` | The component cache and, with HIP, its transfer and host-memory helpers | all |
 | `gufo_ext_hip` | The HIP compile definitions and include paths the public HIP headers need | HIP only |
+| `gufo::qwen_family` | Experimental: the Qwen tokenizer, chat template, control tokens, draft vocabulary, vision and, with HIP, kernels behind `<gufo/ext/families/qwen/...>`. Extensions and Linux loadable modules link it too | all |
+| `gufo::<name>` | Another extension's export, outside this boundary with no API promise ([depend on another extension](writing-extensions.md#depend-on-another-extension)) | per export |
+
+## Model directories
+
+`--model` can name a directory instead of a GGUF. The provider whose
+`probe(model_root)` accepts it creates the runner, with
+`TextRunnerOptions::model_path` set to the directory and no GGUF reader. A
+provider with a runner but no drivers of its own gets `prompt`, `chat` and
+`bench` through the server's backend.
+
+## Session state
+
+Declare a session's buffers in a `mem::StateDeclaration` (`gufo/ext/state.hpp`)
+and allocate them with `mem::SessionState::Create`; return its account from
+`state_account()`, claim the declaration's `Bytes` and `ContextBytes`, and call
+`Ensure` before each write ([state memory](internal/state-memory.md)).
 
 ## Continuation
 
@@ -75,7 +92,9 @@ refuses to load one that leaves a field at zero. While other sessions decode,
 Gufo bounds each prompt pass with it so they don't wait for all of it:
 
 - `pass_tokens` is the width Gufo uses for a prompt beside decoders, normally
-  the model's own prefill pass. A prompt running alone isn't bounded.
+  the model's own prefill pass. A prompt running alone gets it too while
+  another session is free, so an arrival waits for at most one such pass; with
+  every session taken it isn't bounded.
 - `max_layer_groups` is how many layer groups one such pass may be split into.
   One runs every pass unsplit, so decoders wait for the whole pass.
 - `max_yield_decode_width` is how many sessions one decode step between groups

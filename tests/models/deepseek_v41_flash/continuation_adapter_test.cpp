@@ -318,7 +318,8 @@ void CheckMode(const std::shared_ptr<ds41::Model>& model, bool speculative) {
     Require(bool(session), error);
     sessions.push_back(std::move(session));
   }
-  model->FitExpertCache(0);
+  Require(model->FitExpertCache(model->ExpertCacheHeadroom()),
+          "expert-cache fit failed");
   ds41::ContinuationAdapter adapter(model, mode, model->MaxContext(), {1, 2, 3},
                                     std::move(sessions));
   Require(adapter.GetCapabilities().persistent_encoding,

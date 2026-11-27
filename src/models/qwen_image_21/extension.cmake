@@ -13,7 +13,6 @@ gufo_extension_target(
     gufo_core
     gufo_qwen_text
     ICU::i18n
-    PNG::PNG
 )
 
 if(TARGET gufo_qwen_image_21)
@@ -47,7 +46,7 @@ if(TARGET gufo_qwen_image_21_hip)
   )
   target_compile_definitions(gufo_qwen_image_21_hip PUBLIC ENGINE_ENABLE_HIP=1)
   target_compile_options(gufo_qwen_image_21_hip PRIVATE
-    $<$<COMPILE_LANGUAGE:HIP>:-O3;${GUFO_CLANG_OPTION}-ffp-contract=off>)
+    $<$<COMPILE_LANGUAGE:HIP>:${GUFO_CLANG_OPTION}-O3;${GUFO_CLANG_OPTION}-ffp-contract=off>)
   set_source_files_properties(${GUFO_EXTENSION_BUILD_ROOT}/hip/attention.hip PROPERTIES
     COMPILE_OPTIONS
     "-gline-tables-only;-Xarch_device;-mllvm=-amdgpu-sched-strategy=iterative-ilp")

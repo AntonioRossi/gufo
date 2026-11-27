@@ -7,6 +7,10 @@
 
 #include "variant.h"
 
+namespace gufo::expert_stream {
+class Store;
+}
+
 DS41_NAMESPACE_BEGIN
 
 struct ds41_tokens {
@@ -156,11 +160,10 @@ inline constexpr std::uint32_t DS41_SESSION_PAYLOAD_VERSION = 6;
 
 int ds41_engine_open(ds41_engine** out, const ds41_engine_options* options);
 void ds41_engine_close(ds41_engine* engine);
-/* Streamed engines: re-sizes the expert cache seeded at open from the memory
- * free now, shrinking it or seeding the room left. Call once the sessions and
- * other long-lived buffers exist; pending_bytes is what the caller will still
- * allocate later (cache backing that grows with use). 0 on success. */
-int ds41_engine_fit_experts(ds41_engine* engine, uint64_t pending_bytes);
+/* Streamed engines: fit the expert cache to the given grant. grant_bytes is
+ * the cache and prefetch budget; the caller subtracts the headroom. 0 on
+ * success. */
+int ds41_engine_fit_experts(ds41_engine* engine, uint64_t grant_bytes);
 struct ds41_expert_cache_status {
   bool enabled = false;
   uint64_t requested_bytes = 0;
@@ -169,6 +172,9 @@ struct ds41_expert_cache_status {
 };
 /* Read the effective expert-store mode, explicit cap, and allocation. */
 ds41_expert_cache_status ds41_engine_expert_cache_status(const ds41_engine* engine);
+/* The shared store and its host headroom, for the serving resource claim. */
+gufo::expert_stream::Store* ds41_engine_expert_store(ds41_engine* engine);
+uint64_t ds41_engine_expert_cache_headroom(const ds41_engine* engine);
 int ds41_engine_vocab_size(const ds41_engine* engine);
 const char* ds41_engine_model_name(const ds41_engine* engine);
 

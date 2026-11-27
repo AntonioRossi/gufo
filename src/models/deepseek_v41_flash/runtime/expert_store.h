@@ -2,7 +2,9 @@
 #define GUFO_MODELS_DEEPSEEK_V41_FLASH_RUNTIME_EXPERT_STORE_H_
 
 #include <cstdint>
+#include <vector>
 
+#include <gufo/ext/experimental/expert_stream.hpp>
 #include <hip/hip_runtime_api.h>
 
 #include "variant.h"
@@ -27,9 +29,6 @@ struct ds41_expert_store_stats {
   uint64_t prefetch_dropped_bytes = 0; // prefetched bytes no prepare consumed
 };
 
-/* Available unified host memory, including reclaimable file cache. */
-uint64_t ds41_expert_available_memory();
-
 /* What ds41_expert_store_prepare stages for the layer, for work overlapped
  * with the projection reads. The id rows keep their route positions: hit_ids
  * holds the resident experts with misses as -1, miss_ids the read experts
@@ -48,31 +47,28 @@ struct ds41_expert_overlap {
 };
 
 /* The model and its shard descriptors outlive the store. cache_limit_bytes
- * bounds the pool when nonzero; zero sizes it from available device memory. */
-ds41_expert_store* ds41_expert_store_create(const ds41_model* model,
-                                            const ds41_weights* weights,
-                                            uint64_t cache_limit_bytes = 0);
+ * bounds the pool when nonzero. The ranking is copied into the store;
+ * ranking_source names it. Attach the optional tails file separately, once,
+ * before the first fit. */
+ds41_expert_store* ds41_expert_store_create(
+    const ds41_model* model, const ds41_weights* weights,
+    uint64_t cache_limit_bytes,
+    const std::vector<gufo::expert_stream::Ranked>& ranking,
+    const char* ranking_source);
 void ds41_expert_store_destroy(ds41_expert_store* store);
 
 /* Splits every expert read between the model's GGUF and a tails file built by
  * tools/ds41/pack_expert_tails.py, normally on a second drive, so both read
- * at once. Call before seeding. The file must match this model's expert
- * tensors byte for byte; false (with a message) leaves reads unchanged. */
+ * at once. Call once after create and before the first fit. The file must
+ * match this model's expert tensors byte for byte; false (with a message)
+ * leaves reads unchanged. */
 bool ds41_expert_store_attach_tails(ds41_expert_store* store, const char* path);
 
-/* Re-sizes the cache from the memory free now, leaving reserve_bytes that it
- * never grows into, after allocating the prefetch stage: frees its newest
- * chunks, keeping the highest-scored experts, when it is over the new limit.
- * Call at startup once everything else long-lived is allocated, then seed
- * again to fill any room left. A nonzero cache_limit_bytes still bounds the
- * pool. False when the stage or the shrink failed. */
-bool ds41_expert_store_set_reserve(ds41_expert_store* store, uint64_t reserve_bytes);
-
-/* Prime the cache from the built-in V4.1 ranking or an optional
- * DS41_EXPERT_HISTOGRAM_V1 text file. Priming is startup work and does not
- * count as inference in the statistics. */
-bool ds41_expert_store_seed_default(ds41_expert_store* store);
-bool ds41_expert_store_seed(ds41_expert_store* store, const char* path);
+/* Sizes the cache to the host grant. grant_bytes is the cache and prefetch
+ * budget; the caller subtracts the headroom. The store applies
+ * Policy::cache_limit_bytes once and deducts the prefetch stage. False when
+ * the stage, the shrink or the seed reads fail. */
+bool ds41_expert_store_fit(ds41_expert_store* store, uint64_t grant_bytes);
 
 /* Routes are device [n_tokens][6]. The returned gate, up and down tables map
  * each expert index to its device weights and stay valid until the next call.
@@ -120,7 +116,7 @@ void ds41_expert_store_predict_flush(ds41_expert_store* store);
 
 /* DS41_EXPERT_TRACE=path writes a binary routing trace (the seeded cache,
  * then each prepare's routes, hits and timing) for
- * tools/ds41/prefetch_sim.py. Decoders add router predictions for later
+ * tools/expert_stream/prefetch_sim.py. Decoders add router predictions for later
  * layers with ds41_expert_store_trace_prediction once the target layer's
  * prepare returned. Tracing is a measurement mode: it disables the
  * production prediction and adds router work. */
@@ -135,6 +131,10 @@ ds41_expert_store_stats ds41_expert_store_get_stats(
     const ds41_expert_store* store);
 ds41_expert_cache_status ds41_expert_store_get_cache_status(const ds41_expert_store* store);
 void ds41_expert_store_log(const ds41_expert_store* store);
+
+/* The shared store behind this wrapper, for the serving resource claim. */
+gufo::expert_stream::Store* ds41_expert_store_native(ds41_expert_store* store);
+uint64_t ds41_expert_store_headroom(const ds41_expert_store* store);
 
 DS41_NAMESPACE_END
 

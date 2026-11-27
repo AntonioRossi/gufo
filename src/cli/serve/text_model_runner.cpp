@@ -18,6 +18,9 @@
 #include "src/core/json.hpp"
 #include "src/mem/account.hpp"
 #include "src/mem/ledger.hpp"
+#if defined(ENGINE_ENABLE_HIP)
+#include "src/core/hip/expert_stream/store.hpp"
+#endif
 
 namespace gufo::server {
 
@@ -75,7 +78,10 @@ std::optional<ChatRequest> ConstrainChatRequest(
     std::vector<sampling::JsonConstraint::Tool> tools;
     const bool required =
         request.tool_choice == ChatRequest::ToolChoice::kRequired;
-    const auto* syntax = selected.format ? nullptr : &*selected.dialect->syntax;
+    const auto native_syntax = runner.ToolGrammarSyntax(request);
+    const auto* syntax = native_syntax     ? &*native_syntax
+                         : selected.format ? nullptr
+                                           : &*selected.dialect->syntax;
     const auto format = selected.format.value_or(Format::kJson);
     for (const auto& tool : request.tools) {
       const auto definition = tool.definition_json.empty()
@@ -126,13 +132,16 @@ std::optional<ChatRequest> ConstrainChatRequest(
   }
   // The reasoning phase uses the provider's delimiters, as the response
   // parsers do. Reasoning the prompt opened may still repeat the opener;
-  // otherwise the model may open it itself unless the request disabled it.
+  // otherwise the model may open it itself. A runner whose prompt closed
+  // reasoning reports a text state, so kAuto with reasoning disabled is a
+  // model whose lowest effort still thinks (Inkling): the grammar leaves it
+  // room, as the response parsers do.
   const auto initial = runner.InitialOutputState(request);
-  const auto reasoning = runner.ReasoningDelimiters();
+  const auto reasoning = runner.ReasoningGrammarMarkers(request).value_or(
+      runner.ReasoningDelimiters());
   if (initial == ext::InitialOutputState::kReasoning)
     grammar = sampling::JsonConstraint::WithReasoning(grammar, reasoning.close);
-  else if (initial == ext::InitialOutputState::kAuto &&
-           request.reasoning.enabled.value_or(true) && !reasoning.open.empty())
+  else if (initial == ext::InitialOutputState::kAuto && !reasoning.open.empty())
     grammar = sampling::JsonConstraint::WithReasoning(grammar, reasoning.close,
                                                       reasoning.open);
   sampling->constraint = runner.BindConstraint(grammar);
@@ -325,7 +334,7 @@ struct TextRunnerPool::Impl {
       // zero unless the backend can lend them.
       const auto borrowable = mem::StateLedger::Process().BorrowableBytes();
       const auto automatic =
-          resources.retained_snapshot_capacity_bytes.value_or(0) + borrowable;
+          AutomaticRetainedBytes(resources, state_count) + borrowable;
       const auto ceiling =
           resources.retained_snapshot_ceiling_bytes.value_or(automatic) +
           borrowable;
@@ -352,7 +361,7 @@ struct TextRunnerPool::Impl {
             validated.runner, state_count, std::min(requested, ceiling),
             disk_cache_options, !ram_cache_options.capacity_bytes,
             std::max(ceiling, ComponentTextCache::kOffMetadataBytes),
-            ram_cache_options.enabled);
+            ram_cache_options.enabled, validated.resources.expert_cache);
       } catch (const cache::ResourceExhausted&) {
         Logger::Warn("cache",
                      "schema=component-cache-v1 event=ram_cache_refused "
@@ -394,6 +403,90 @@ struct TextRunnerPool::Impl {
   }
   mutable std::mutex host_sampler_mutex;
   std::function<ext::HostMemorySample()> host_sampler;
+
+  // A streamed model's expert cache fills the host down to its own floor on
+  // purpose, so below the host reserve is its steady state, not pressure.
+  // Below that floor (or the free CMA pages), another process took the
+  // memory. Missing without streaming: the host reserve applies.
+  std::optional<std::uint64_t> ExpertReserve(
+      const ext::HostMemorySample& sample) const {
+#if defined(ENGINE_ENABLE_HIP)
+    if (const auto* store = validated.resources.expert_cache.store)
+      return std::max<std::uint64_t>(sample.cma_free, store->FloorBytes());
+#endif
+    (void)sample;
+    return std::nullopt;
+  }
+
+  // The store also stops at its floor of room under the cgroup
+  // (ext::HostAvailableBytes), which MemAvailable does not see. Folds that
+  // room into `sample.available`, so that measured against `reserve` a
+  // cgroup below the floor is pressure, and one with room is required to
+  // restore. The cgroup has no CMA pages: it is held to the floor itself.
+  ext::HostMemorySample ExpertSample(ext::HostMemorySample sample,
+                                     std::uint64_t reserve) const {
+#if defined(ENGINE_ENABLE_HIP)
+    const auto floor = validated.resources.expert_cache.store->FloorBytes();
+    const auto extra = reserve - std::min(reserve, floor);
+    if (sample.cgroup_available <
+        sample.available - std::min(sample.available, extra))
+      sample.available = sample.cgroup_available + extra;
+#else
+    (void)reserve;
+#endif
+    return sample;
+  }
+
+  // Under pressure the expert cache gives memory back first: its coldest
+  // experts cost less than the prompt cache's checkpoints, and it is the
+  // largest holder. It is restored to its grant once what it gave back is
+  // free again: more than the floor, the released bytes and a margin are
+  // available. Updates `sample` after a release.
+  void RelieveExperts(ext::HostMemorySample& sample, std::uint64_t reserve) {
+#if defined(ENGINE_ENABLE_HIP)
+    auto* store = validated.resources.expert_cache.store;
+    const std::uint64_t relief = ComponentTextCache::kHostPressureReliefBytes;
+    if (sample.available < reserve) {
+      const auto shortfall = reserve - sample.available;
+      const auto start = std::chrono::steady_clock::now();
+      const auto released = store->Release(shortfall + relief);
+      if (released || !expert_pressure_reported)
+        Logger::Warn(
+            "cache",
+            "schema=component-cache-v1 event=expert_cache_release "
+            "shortfall_bytes=" +
+                std::to_string(shortfall) + " released_bytes=" +
+                std::to_string(released) + " cache_bytes=" +
+                std::to_string(store->GetStats().cache_bytes) + " ms=" +
+                std::to_string(std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - start)
+                                   .count()) +
+                " floor_bytes=" + std::to_string(reserve) + " " +
+                ext::DescribeHostMemory(sample));
+      expert_pressure_reported = true;
+      if (released)
+        sample = ExpertSample(HostSample(), reserve);
+      return;
+    }
+    expert_pressure_reported = false;
+    // Restore also when Release held the cache without freeing anything (it
+    // was empty): Restore returns 0 when nothing is held back.
+    const auto released = store->ReleasedBytes();
+    if (sample.available > reserve + released + kExpertRestoreMarginBytes)
+      if (const auto raised = store->Restore())
+        Logger::Info("cache",
+                     "schema=component-cache-v1 event=expert_cache_restore "
+                     "raised_bytes=" +
+                         std::to_string(raised) + " " +
+                         ext::DescribeHostMemory(sample));
+#else
+    (void)sample;
+    (void)reserve;
+#endif
+  }
+  bool expert_pressure_reported{};
+  static constexpr std::uint64_t kExpertRestoreMarginBytes = std::uint64_t{256}
+                                                             << 20;
   ValidatedRunner validated;
   // Declared before the cache: the cap outlives the sessions' regions.
   SharedStateCap shared_state_cap;
@@ -480,11 +573,15 @@ struct TextRunnerPool::Request::Impl {
       if (count > prefill_offset && count < prompt.size()) {
         count = std::max(Aligned(count), prefill_offset);
       } else if (const auto aligned = Aligned(count);
-                 aligned > prefill_offset && aligned < count &&
-                 lease->TryReserveSnapshot(
-                     lease->CaptureBytes(aligned), aligned, retain_fallback,
-                     SnapshotPurpose::kContinuation,
-                     std::span<const TextRunnerToken>(prompt).first(aligned))) {
+                 aligned > prefill_offset && aligned < count && [&] {
+                   const auto bytes = lease->CaptureBytes(aligned);
+                   return bytes &&
+                          lease->TryReserveSnapshot(
+                              *bytes, aligned, retain_fallback,
+                              SnapshotPurpose::kContinuation,
+                              std::span<const TextRunnerToken>(prompt).first(
+                                  aligned));
+                 }()) {
         // A disabled cache (or a refused disk-only capture) must not prepare
         // checkpoint scratch or split a pass for a fallback it cannot keep.
         count = aligned;
@@ -1164,7 +1261,8 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens,
         // Admission happens before the pass, as for the prompt snapshot
         // captured after one; later targets are admitted when captured.
         bytes = impl_->lease->CaptureBytes(snapshot_position);
-        if (impl_->lease->TryReserveSnapshot(
+        if (bytes &&
+            impl_->lease->TryReserveSnapshot(
                 *bytes, snapshot_position,
                 impl_->retain_fallback && impl_->fallback_position == 0,
                 SnapshotPurpose::kContinuation, impl_->snapshot_tokens)) {
@@ -1635,12 +1733,26 @@ const TextModelRunner& TextRunnerPool::runner() const noexcept {
 
 void TextRunnerPool::Idle() const {
   impl_->validated.runner->Idle();
+  auto sample = impl_->HostSample();
+  const auto reserve = impl_->ExpertReserve(sample);
+  if (reserve) {
+    sample = impl_->ExpertSample(sample, *reserve);
+    impl_->RelieveExperts(sample, *reserve);
+  }
   if (impl_->component_cache)
-    (void)impl_->component_cache->RelieveHostPressure(impl_->HostSample());
+    (void)impl_->component_cache->RelieveHostPressure(sample, reserve);
 }
 
 std::optional<std::uint64_t> TextRunnerPool::AdmissionShortfall() const {
-  const auto shortfall = ext::HostReserveShortfallBytes(impl_->HostSample());
+  const auto sample = impl_->HostSample();
+  if (const auto reserve = impl_->ExpertReserve(sample)) {
+    const auto available = impl_->ExpertSample(sample, *reserve).available;
+    const auto shortfall = available < *reserve ? *reserve - available : 0;
+    if (shortfall <= *reserve / 2)
+      return std::nullopt;
+    return shortfall;
+  }
+  const auto shortfall = ext::HostReserveShortfallBytes(sample);
   if (shortfall <= kAdmissionShortfallBytes)
     return std::nullopt;
   return shortfall;
@@ -1835,7 +1947,7 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
     const CancellationCheck& is_cancelled,
     std::shared_ptr<const TextPromptContext> context, bool reuse_prompt,
     std::size_t cache_prefix_tokens, bool stop_at_eos, bool persist,
-    StateTicket* state) {
+    StateTicket* state, const RestoreCopyRunner& run_copies) {
   sampling_config.Validate();
   if (prompt.empty()) {
     throw std::invalid_argument("text runner prompt must not be empty");
@@ -1856,7 +1968,7 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
     auto lease = impl_->component_cache->Acquire(
         prompt, is_cancelled, context, reuse_prompt, cache_prefix_tokens,
         stop_at_eos, persist, state ? state->tokens : 0,
-        state ? &state->reservation : nullptr);
+        state ? &state->reservation : nullptr, run_copies);
     if (!lease)
       return {};
     Request request(std::make_unique<Request::Impl>(
@@ -1883,6 +1995,10 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
     std::vector<TextRunnerToken> prompt,
     const CancellationCheck& is_cancelled) {
   return Acquire(std::move(prompt), sampling::SamplingConfig{}, is_cancelled);
+}
+
+bool TextRunnerPool::restores_beside_decode() const noexcept {
+  return impl_->component_cache->restores_beside_decode();
 }
 
 bool TextRunnerPool::shared_state() const noexcept {
@@ -1987,10 +2103,10 @@ std::optional<TextPendingPublication> TextRunnerPool::PendingPublication(
 
 std::shared_ptr<const std::atomic<bool>> TextRunnerPool::WarmDisk(
     std::span<const TextRunnerToken> prompt, const TextPromptContext* context,
-    std::size_t stable) const {
-  return impl_->component_cache
-             ? impl_->component_cache->WarmDisk(prompt, context, stable)
-             : nullptr;
+    std::size_t stable, std::chrono::microseconds beside_after) const {
+  return impl_->component_cache ? impl_->component_cache->WarmDisk(
+                                      prompt, context, stable, beside_after)
+                                : nullptr;
 }
 
 std::size_t TextRunnerPool::CachedPrefixTokens(

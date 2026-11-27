@@ -22,12 +22,17 @@ and persistent service prompt caching. This port does not claim conformance.
 See the [implementation notes](../../../docs/internal/models/deepseek-v4.1-flash/README.md)
 for the selected artifacts and check limits.
 
-Streaming uses `Model::Load`, `Model::FitExpertCache`, and the expert store
-from the pinned source. The adapter fits the cache after all selected sessions
-and persistent buffers exist. The shared component cache supplies RAM backing.
-The source cap, cache-fit calculations, and memory reserves are unchanged.
-The added `ExpertCacheStatus` getter reports the store's requested limit,
-allocated bytes, and current limit. It does not alter allocation.
+Streaming uses the shared `expert_stream::Store` through a V4.1 adapter.
+The adapter describes the V4.1 expert layout and keeps the gate, up, and down
+tables, the overlap callback, the ranking, the optional tails file, the trace,
+and the statistics. Serving sizes the store through
+`TextRunnerResourceClaim::expert_cache` after the prompt-cache backing exists.
+The standalone prompt and chat paths fit it once through the runner claim and
+`HostAvailableBytes`. The benchmark fits it once after its first normal
+session exists. The store owns the cache, reads, prefetch, staging, and the
+effective limit. The extension manifest requires API 0.3.43.
+The `ExpertCacheStatus` getter reports the requested limit, allocated bytes,
+and effective limit. It does not alter allocation.
 The extension manifest declares both options. The host sends explicit values
 through `provider_options`. `ResolveExpertOptions` supplies the defaults and
 checks the cache condition. Other providers do not accept these options.
@@ -51,8 +56,9 @@ The CLI context stays at 4096 tokens through `kDefaultContext`.
 It preserves the source token pattern, timing boundaries, repetition order,
 and mean with sample standard deviation. Decode starts from 16 tokens at
 depth zero. The model and expert store remain alive across repetitions.
-The benchmark does not call `FitExpertCache`, as in the source benchmark.
-It reports the existing `ExpertCacheStatus` outside the measured intervals.
+The benchmark fits the shared expert cache once, after its first normal
+session exists, and uses that session for the first repetition. It reports
+the existing `ExpertCacheStatus` outside the measured intervals.
 `TextBenchOptions::provider_options` forwards the streaming flag and cache cap. Sampled
 decoding, nonzero depth, concurrency, and prefill validation are not exposed
 by this first benchmark path. Prompt, chat, and HTTP paths are unchanged.

@@ -12,6 +12,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <gufo/ext/host_budget.hpp>
+#include <limits>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -38,6 +41,7 @@ struct ProbeStatus {
   bool requested_streaming = false;
   std::uint64_t requested_cache_bytes = 0;
   ds41_expert_cache_status expert_cache{};
+  bool expert_cache_read = false;
   unsigned tokenized_lines = 0;
   unsigned tokenized_tokens = 0;
 
@@ -82,6 +86,65 @@ struct ProbeStatus {
     return true;
   }
 };
+
+using DecoderPtr =
+    std::unique_ptr<ds41_decoder, decltype(&ds41_decoder_destroy)>;
+using DsparkStatePtr =
+    std::unique_ptr<ds41_dspark_state, decltype(&ds41_dspark_state_destroy)>;
+using SessionPtr = std::unique_ptr<ds41_session, decltype(&ds41_session_free)>;
+struct FileCloser {
+  void operator()(FILE* file) const {
+    if (file)
+      std::fclose(file);
+  }
+};
+using FilePtr = std::unique_ptr<FILE, FileCloser>;
+
+/* Reads the cache status once, when the path has no reading yet, then closes
+ * the engine. This covers an exception before the fit. */
+struct EngineCloser {
+  ProbeStatus* status;
+
+  void operator()(ds41_engine* engine) const {
+    if (!engine)
+      return;
+    if (!status->expert_cache_read) {
+      status->expert_cache = ds41_engine_expert_cache_status(engine);
+      status->expert_cache_read = true;
+    }
+    ds41_engine_close(engine);
+  }
+};
+
+/* One fit for every streamed probe path. The store limit stays zero until
+ * Fit, so each path fits after it allocates its decoders, sessions, and
+ * buffers and before its first evaluation. This helper reports a failure
+ * through the prefill transition. It records the fit reading when the caller
+ * asks for it, and always on failure; ordinary decode uses its final reading
+ * on success. */
+int FitStreamedExperts(ds41_engine* engine, ProbeStatus* status, bool record) {
+  if (!status->requested_streaming) {
+    if (record) {
+      status->expert_cache = ds41_engine_expert_cache_status(engine);
+      status->expert_cache_read = true;
+    }
+    return 0;
+  }
+  const std::uint64_t available = gufo::ext::HostAvailableBytes();
+  const std::uint64_t headroom = ds41_engine_expert_cache_headroom(engine);
+  const std::uint64_t grant = available > headroom ? available - headroom : 0;
+  if (ds41_engine_fit_experts(engine, grant) != 0) {
+    status->expert_cache = ds41_engine_expert_cache_status(engine);
+    status->expert_cache_read = true;
+    return status->stages.Transition(Stage::kPrefill, 0, 1,
+                                     "expert_cache_fit_failed");
+  }
+  if (record) {
+    status->expert_cache = ds41_engine_expert_cache_status(engine);
+    status->expert_cache_read = true;
+  }
+  return 0;
+}
 
 std::uint64_t MeminfoKiB(const char* key) {
   std::ifstream in("/proc/meminfo");
@@ -156,24 +219,19 @@ int Argmax(const float* row, std::size_t vocab) {
   return best;
 }
 
-/* Prefills `prompt` into a new decoder in batches. */
-ds41_decoder* Prefill(ds41_engine* engine, const std::vector<int>& prompt,
-                      uint32_t context, std::vector<float>* last) {
-  ds41_decoder* d = ds41_decoder_create(engine, context);
-  if (!d)
-    return nullptr;
+/* Prefills `prompt` into an existing decoder in batches. */
+int PrefillDecoder(ds41_decoder* d, const std::vector<int>& prompt,
+                   std::vector<float>* last) {
   const uint32_t cap = ds41_decoder_batch_capacity(d);
   for (uint32_t at = 0; at < prompt.size();) {
     const uint32_t n = std::min<uint32_t>(cap, (uint32_t)prompt.size() - at);
     const bool final = at + n == prompt.size();
     if (ds41_decoder_eval(d, prompt.data() + at, n, last->data(), final ? 1 : 0,
-                          nullptr, nullptr) != 0) {
-      ds41_decoder_destroy(d);
-      return nullptr;
-    }
+                          nullptr, nullptr) != 0)
+      return 1;
     at += n;
   }
-  return d;
+  return 0;
 }
 
 /* --joint-check N: N sessions (prefixes of the prompt) run speculative
@@ -181,57 +239,77 @@ ds41_decoder* Prefill(ds41_engine* engine, const std::vector<int>& prompt,
  * decoder; every row's logits must match bit for bit. The timings compare
  * the joint evaluation with the sessions' own evaluations. */
 int JointProbe(ds41_engine* engine, const std::vector<int>& prompt,
-               uint32_t context, int sessions, int cycles, uint32_t budget) {
+               uint32_t context, int sessions, int cycles, uint32_t budget,
+               ProbeStatus* status) {
   const std::size_t vocab = (std::size_t)ds41_engine_vocab_size(engine);
   context = std::max<uint32_t>(context, (uint32_t)prompt.size() + 4096);
-  std::vector<float> last(vocab);
-  std::vector<ds41_decoder*> joint, solo;
-  std::vector<int> next;
+  std::vector<std::vector<int>> heads;
+  heads.reserve(sessions);
+  std::vector<DecoderPtr> joint, solo;
+  std::vector<ds41_decoder*> joint_raw;
+  joint.reserve(sessions);
+  solo.reserve(sessions);
+  joint_raw.reserve(sessions);
   for (int s = 0; s < sessions; ++s) {
     const std::size_t len = std::max<std::size_t>(
         1, prompt.size() - std::min(prompt.size() - 1, (std::size_t)5 * s));
-    const std::vector<int> head(prompt.begin(),
-                                prompt.begin() + (std::ptrdiff_t)len);
-    joint.push_back(Prefill(engine, head, context, &last));
-    solo.push_back(Prefill(engine, head, context, &last));
+    heads.emplace_back(prompt.begin(), prompt.begin() + (std::ptrdiff_t)len);
+    joint.emplace_back(ds41_decoder_create(engine, context),
+                       &ds41_decoder_destroy);
+    solo.emplace_back(ds41_decoder_create(engine, context),
+                      &ds41_decoder_destroy);
     if (!joint.back() || !solo.back())
       return 1;
-    next.push_back(Argmax(last.data(), vocab));
+    joint_raw.push_back(joint.back().get());
   }
   std::vector<std::vector<float>> jrows(sessions), srows(sessions);
   for (int s = 0; s < sessions; ++s) {
     jrows[s].resize(vocab * DS41_DECODER_MAX_SPECULATIVE);
     srows[s].resize(vocab * DS41_DECODER_MAX_SPECULATIVE);
   }
+  std::vector<std::vector<int>> batch(
+      (std::size_t)sessions, std::vector<int>(DS41_DECODER_MAX_SPECULATIVE));
+  std::vector<uint32_t> ns((std::size_t)sessions);
+  std::vector<const int*> tokens((std::size_t)sessions);
+  std::vector<float*> out((std::size_t)sessions);
+  std::vector<int> next((std::size_t)sessions);
+  for (int s = 0; s < sessions; ++s) {
+    tokens[s] = batch[s].data();
+    out[s] = jrows[s].data();
+  }
+  std::vector<float> last(vocab);
+  const int fit = FitStreamedExperts(engine, status, true);
+  if (fit != 0)
+    return fit;
+  for (int s = 0; s < sessions; ++s) {
+    if (PrefillDecoder(joint[s].get(), heads[s], &last) != 0 ||
+        PrefillDecoder(solo[s].get(), heads[s], &last) != 0)
+      return 1;
+    next[s] = Argmax(last.data(), vocab);
+  }
   std::size_t rows = 0, identical = 0, total_rows = 0;
   double joint_ms = 0.0, solo_ms = 0.0;
   for (int c = 0; c < cycles; ++c) {
-    std::vector<uint32_t> ns(sessions);
-    std::vector<std::vector<int>> batch(sessions);
-    std::vector<const int*> tokens(sessions);
-    std::vector<float*> out(sessions);
     uint32_t used = 0;
     for (int s = 0; s < sessions; ++s) {
       const uint32_t room = budget - used - (sessions - s - 1);
       ns[s] = std::min<uint32_t>(1 + (uint32_t)(c + 2 * s) % 6, room);
       used += ns[s];
-      batch[s].push_back(next[s]);
+      batch[s][0] = next[s];
       for (uint32_t i = 1; i < ns[s]; ++i)
-        batch[s].push_back(
-            prompt[(97 * (std::size_t)c + 13 * s + i) % prompt.size()]);
-      tokens[s] = batch[s].data();
-      out[s] = jrows[s].data();
+        batch[s][i] =
+            prompt[(97 * (std::size_t)c + 13 * s + i) % prompt.size()];
     }
     total_rows += used;
     auto t0 = std::chrono::steady_clock::now();
-    if (ds41_decoder_eval_joint(joint.data(), tokens.data(), ns.data(),
+    if (ds41_decoder_eval_joint(joint_raw.data(), tokens.data(), ns.data(),
                                 (uint32_t)sessions, out.data())) {
       std::fprintf(stderr, "joint evaluation failed at cycle %d\n", c);
       return 1;
     }
     auto t1 = std::chrono::steady_clock::now();
     for (int s = 0; s < sessions; ++s)
-      if (ds41_decoder_eval_speculative(solo[s], tokens[s], ns[s],
+      if (ds41_decoder_eval_speculative(solo[s].get(), tokens[s], ns[s],
                                         srows[s].data()))
         return 1;
     auto t2 = std::chrono::steady_clock::now();
@@ -252,8 +330,8 @@ int JointProbe(ds41_engine* engine, const std::vector<int>& prompt,
               c, used, s, i);
       }
       const uint32_t keep = 1 + (uint32_t)(c + s) % ns[s];
-      if (ds41_decoder_commit(joint[s], keep) ||
-          ds41_decoder_commit(solo[s], keep))
+      if (ds41_decoder_commit(joint[s].get(), keep) ||
+          ds41_decoder_commit(solo[s].get(), keep))
         return 1;
       next[s] = Argmax(jrows[s].data() + (keep - 1) * vocab, vocab);
     }
@@ -265,10 +343,6 @@ int JointProbe(ds41_engine* engine, const std::vector<int>& prompt,
       sessions, cycles, rows, (double)total_rows / cycles, identical,
       cycles > 1 ? joint_ms / (cycles - 1) : 0.0,
       cycles > 1 ? solo_ms / (cycles - 1) : 0.0);
-  for (int s = 0; s < sessions; ++s) {
-    ds41_decoder_destroy(joint[s]);
-    ds41_decoder_destroy(solo[s]);
-  }
   return identical == rows ? 0 : 1;
 }
 
@@ -280,118 +354,150 @@ int JointProbe(ds41_engine* engine, const std::vector<int>& prompt,
  * match serial decode exactly.
  * --spec-bench N: times speculative batches of N rows (0: 1 to 8), commit 1. */
 int SpeculativeProbe(ds41_engine* engine, const std::vector<int>& prompt,
-                     uint32_t context, int cycles, int bench, int width) {
+                     uint32_t context, int cycles, int bench, int width,
+                     ProbeStatus* status) {
   const std::size_t vocab = (std::size_t)ds41_engine_vocab_size(engine);
   context = std::max<uint32_t>(context, (uint32_t)prompt.size() + 4096);
   std::vector<float> last(vocab);
   if (bench >= 0) {
-    ds41_decoder* d = Prefill(engine, prompt, context, &last);
+    if (bench > DS41_DECODER_MAX_SPECULATIVE)
+      return 2;
+    DecoderPtr d(ds41_decoder_create(engine, context), &ds41_decoder_destroy);
     if (!d)
       return 1;
+    int batch[DS41_DECODER_MAX_SPECULATIVE];
     std::vector<float> rows(vocab * DS41_DECODER_MAX_SPECULATIVE);
+    const int fit = FitStreamedExperts(engine, status, true);
+    if (fit != 0)
+      return fit;
+    if (PrefillDecoder(d.get(), prompt, &last) != 0)
+      return 1;
     int token = Argmax(last.data(), vocab);
     for (uint32_t n = bench ? (uint32_t)bench : 1;
          n <= (bench ? (uint32_t)bench : 8); ++n) {
-      std::vector<double> ms;
+      double ms[7];
       for (int rep = 0; rep < 7; ++rep) {
         /* The greedy token, then prompt text: distinct tokens route to as
          * many experts as a real draft. */
-        std::vector<int> batch(n, token);
+        batch[0] = token;
         for (uint32_t i = 1; i < n; ++i)
           batch[i] = prompt[(97 * (std::size_t)rep + i) % prompt.size()];
         const auto t0 = std::chrono::steady_clock::now();
-        if (ds41_decoder_eval_speculative(d, batch.data(), n, rows.data()) ||
-            ds41_decoder_commit(d, 1))
+        if (ds41_decoder_eval_speculative(d.get(), batch, n, rows.data()) ||
+            ds41_decoder_commit(d.get(), 1))
           return 1;
-        ms.push_back(std::chrono::duration<double, std::milli>(
-                         std::chrono::steady_clock::now() - t0)
-                         .count());
+        ms[rep] = std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - t0)
+                      .count();
         token = Argmax(rows.data(), vocab);
         /* DS41_PROBE_GAP=1 separates repetitions by an idle gap for GPU
          * profiles; it lowers the clocks, so timings run without it. */
         if (std::getenv("DS41_PROBE_GAP"))
           std::this_thread::sleep_for(std::chrono::milliseconds(30));
       }
-      std::sort(ms.begin() + 1, ms.end());  // the first repetition warms up
+      std::sort(ms + 1, ms + 7);  // the first repetition warms up
       std::printf("spec-bench n=%u at %u: median %.1f ms min %.1f ms\n", n,
-                  ds41_decoder_pos(d), ms[1 + ms.size() / 2 - 1], ms[1]);
+                  ds41_decoder_pos(d.get()), ms[3], ms[1]);
     }
-    ds41_decoder_destroy(d);
     return 0;
   }
   /* Greedy continuation for pass A's drafts, from single-token steps. */
   std::vector<int> greedy;
   std::vector<std::vector<float>> greedy_logits;
-  {
-    ds41_decoder* d = Prefill(engine, prompt, context, &last);
-    if (!d)
+  if (width <= 0 || width > DS41_DECODER_MAX_SPECULATIVE || cycles < 0)
+    return 2;
+  if (vocab == 0)
+    return 1;
+  const auto keep_at = [width](int c) -> std::uint32_t {
+    return 1 +
+           static_cast<std::uint32_t>(c) % static_cast<std::uint32_t>(width);
+  };
+  std::uint64_t keep_rows = 0;
+  for (int c = 0; c < cycles; ++c)
+    keep_rows += keep_at(c);
+  if (keep_rows > static_cast<std::uint64_t>(std::numeric_limits<int>::max()) -
+                      static_cast<std::uint64_t>(width) ||
+      keep_rows > std::numeric_limits<std::size_t>::max() / vocab ||
+      vocab > std::numeric_limits<std::size_t>::max() /
+                  static_cast<std::uint64_t>(width))
+    return 1;
+  const int greedy_rows = static_cast<int>(keep_rows) + width;
+  std::vector<float> rows(vocab * static_cast<std::size_t>(width));
+  std::vector<std::vector<float>> kept(keep_rows, std::vector<float>(vocab));
+  greedy_logits.resize(greedy_rows, std::vector<float>(vocab));
+  greedy.reserve(static_cast<std::size_t>(greedy_rows) + 1);
+  DecoderPtr d(ds41_decoder_create(engine, context), &ds41_decoder_destroy);
+  if (!d)
+    return 1;
+  const int fit = FitStreamedExperts(engine, status, true);
+  if (fit != 0)
+    return fit;
+  if (PrefillDecoder(d.get(), prompt, &last) != 0)
+    return 1;
+  greedy.push_back(Argmax(last.data(), vocab));
+  for (int i = 0; i < greedy_rows; ++i) {
+    if (ds41_decoder_step(d.get(), greedy.back(), last.data(), nullptr,
+                          nullptr))
       return 1;
+    greedy_logits[i] = last;
     greedy.push_back(Argmax(last.data(), vocab));
-    for (int i = 0; i < cycles * width + width; ++i) {
-      if (ds41_decoder_step(d, greedy.back(), last.data(), nullptr, nullptr))
-        return 1;
-      greedy_logits.push_back(last);
-      greedy.push_back(Argmax(last.data(), vocab));
-    }
-    ds41_decoder_destroy(d);
   }
-  std::vector<std::vector<float>> kept[2];
-  std::vector<int> kept_tokens[2];
+  d.reset();
+  std::size_t identical = 0, agree = 0, as_single = 0;
+  double worst = 0.0, worst_single = 0.0;
   for (int pass = 0; pass < 2; ++pass) {
-    ds41_decoder* d = Prefill(engine, prompt, context, &last);
-    if (!d)
+    DecoderPtr pd(ds41_decoder_create(engine, context), &ds41_decoder_destroy);
+    if (!pd)
       return 1;
-    std::vector<float> rows(vocab * width);
+    if (PrefillDecoder(pd.get(), prompt, &last) != 0)
+      return 1;
     std::size_t at = 0;  // greedy index of the next row's token
     for (int c = 0; c < cycles; ++c) {
-      const uint32_t keep = 1 + (uint32_t)c % width;
+      const uint32_t keep = keep_at(c);
       int batch[DS41_DECODER_MAX_SPECULATIVE];
       for (uint32_t r = 0; r < (uint32_t)width; ++r)
         batch[r] =
             pass == 1 && r >= keep ? (int)(1000 + 37 * r + c) : greedy[at + r];
-      if (ds41_decoder_eval_speculative(d, batch, width, rows.data()) ||
-          ds41_decoder_commit(d, keep))
+      if (ds41_decoder_eval_speculative(pd.get(), batch, width, rows.data()) ||
+          ds41_decoder_commit(pd.get(), keep))
         return 1;
       for (uint32_t r = 0; r < keep; ++r) {
-        kept[pass].emplace_back(
-            rows.begin() + (std::ptrdiff_t)(r * vocab),
-            rows.begin() + (std::ptrdiff_t)((r + 1) * vocab));
-        kept_tokens[pass].push_back(Argmax(rows.data() + r * vocab, vocab));
+        const std::size_t k = at + r;
+        const float* row = rows.data() + r * vocab;
+        if (pass == 0) {
+          kept[k].assign(row, row + vocab);
+          agree += Argmax(row, vocab) == greedy[k + 1];
+        } else {
+          double diff = 0.0, diff_single = 0.0;
+          for (std::size_t v = 0; v < vocab; ++v) {
+            if (!std::isfinite(kept[k][v]) || !std::isfinite(row[v]) ||
+                !std::isfinite(greedy_logits[k][v])) {
+              std::fprintf(
+                  stderr,
+                  "non-finite speculative/serial logit at row %zu token %zu\n",
+                  k, v);
+              return 1;
+            }
+            diff = std::max(diff, (double)std::fabs(kept[k][v] - row[v]));
+            diff_single =
+                std::max(diff_single,
+                         (double)std::fabs(kept[k][v] - greedy_logits[k][v]));
+          }
+          identical += diff == 0.0;
+          as_single += diff_single == 0.0;
+          worst = std::max(worst, diff);
+          worst_single = std::max(worst_single, diff_single);
+        }
       }
       at += keep;
     }
-    ds41_decoder_destroy(d);
-  }
-  std::size_t identical = 0, agree = 0, as_single = 0;
-  double worst = 0.0, worst_single = 0.0;
-  for (std::size_t i = 0; i < kept[0].size(); ++i) {
-    double diff = 0.0, diff_single = 0.0;
-    for (std::size_t v = 0; v < vocab; ++v) {
-      if (!std::isfinite(kept[0][i][v]) || !std::isfinite(kept[1][i][v]) ||
-          !std::isfinite(greedy_logits[i][v])) {
-        std::fprintf(
-            stderr,
-            "non-finite speculative/serial logit at row %zu token %zu\n", i, v);
-        return 1;
-      }
-      diff = std::max(diff, (double)std::fabs(kept[0][i][v] - kept[1][i][v]));
-      diff_single = std::max(
-          diff_single, (double)std::fabs(kept[0][i][v] - greedy_logits[i][v]));
-    }
-    identical += diff == 0.0;
-    as_single += diff_single == 0.0;
-    worst = std::max(worst, diff);
-    worst_single = std::max(worst_single, diff_single);
-    /* Row i of pass A predicts greedy[i + 1] under exact single-token decode.
-     */
-    agree += kept_tokens[0][i] == greedy[i + 1];
   }
   std::printf(
       "spec-check: %zu kept rows, %zu bit-identical between passes (max |diff| "
       "%.3g); against single-token decode: argmax matches on %zu, logits "
       "bit-identical on %zu (max |diff| %.3g)\n",
-      kept[0].size(), identical, worst, agree, as_single, worst_single);
-  return identical == kept[0].size() && as_single == kept[0].size() ? 0 : 1;
+      kept.size(), identical, worst, agree, as_single, worst_single);
+  return identical == kept.size() && as_single == kept.size() ? 0 : 1;
 }
 }  // namespace
 
@@ -400,15 +506,25 @@ int SpeculativeProbe(ds41_engine* engine, const std::vector<int>& prompt,
  * drafts with --dspark); the outputs must match.
  * --dspark-sweep repeats the DSpark run with at most 1 to 5 drafts. */
 int DsparkProbe(ds41_engine* engine, const std::vector<int>& prompt,
-                uint32_t context, int n_tokens, bool sweep) {
+                uint32_t context, int n_tokens, bool sweep,
+                ProbeStatus* status) {
   const int ctx =
       (int)std::max<std::size_t>(context, prompt.size() + n_tokens + 16);
-  ds41_session* session = nullptr;
-  if (ds41_session_create(&session, engine, ctx,
-                          ds41_engine_has_dspark(engine)) != 0) {
+  ds41_session* raw = nullptr;
+  if (ds41_session_create(&raw, engine, ctx, ds41_engine_has_dspark(engine)) !=
+      0) {
     std::fprintf(stderr, "DSpark session creation failed\n");
     return 1;
   }
+  SessionPtr session_owner(raw, &ds41_session_free);
+  ds41_session* session = session_owner.get();
+  std::vector<int> plain;
+  std::vector<int> spec;
+  plain.reserve((std::size_t)n_tokens);
+  spec.reserve((std::size_t)n_tokens);
+  const int fit = FitStreamedExperts(engine, status, true);
+  if (fit != 0)
+    return fit;
   char error[256] = {};
   ds41_tokens tokens{const_cast<int*>(prompt.data()), (int)prompt.size(),
                      (int)prompt.size()};
@@ -420,7 +536,6 @@ int DsparkProbe(ds41_engine* engine, const std::vector<int>& prompt,
     std::fprintf(stderr, "sync failed: %s\n", error);
     return 1;
   }
-  std::vector<int> plain;
   auto t0 = now();
   while ((int)plain.size() < n_tokens) {
     const int token = ds41_session_argmax(session);
@@ -443,7 +558,7 @@ int DsparkProbe(ds41_engine* engine, const std::vector<int>& prompt,
       if (ds41_session_sync(session, &tokens, 0, error, sizeof(error)) != 0)
         return 1;
     }
-    std::vector<int> spec;
+    spec.clear();
     int block[32];
     int produced = 0;
     uint64_t base_drafted = 0, base_accepted = 0, base_steps = 0, base_full = 0;
@@ -513,7 +628,6 @@ int DsparkProbe(ds41_engine* engine, const std::vector<int>& prompt,
     if (same < n_tokens)
       return 1;
   }
-  ds41_session_free(session);
   return 0;
 }
 
@@ -523,48 +637,87 @@ int DsparkProbe(ds41_engine* engine, const std::vector<int>& prompt,
  * logits.f32 ([block][vocab] head logits before the Markov bias) and
  * draft.txt (first feature position, rows, anchor, drafts). */
 int DsparkDump(ds41_engine* engine, const std::vector<int>& prompt,
-               const char* dir) {
-  ds41_decoder* d = ds41_decoder_create(engine, (uint32_t)prompt.size() + 16);
-  ds41_dspark_state* s = d ? ds41_dspark_state_create(engine, d) : nullptr;
+               const char* dir, ProbeStatus* status) {
+  if (prompt.size() < 4)
+    return status->stages.Transition(Stage::kPrefill, 0, 1,
+                                     "dspark_prefix_too_short");
+  constexpr uint32_t kOthers = 1;
+  DecoderPtr d(ds41_decoder_create(engine, (uint32_t)prompt.size() + 16),
+               &ds41_decoder_destroy);
+  DsparkStatePtr s(d ? ds41_dspark_state_create(engine, d.get()) : nullptr,
+                   &ds41_dspark_state_destroy);
   std::vector<float> logits((std::size_t)ds41_engine_vocab_size(engine));
   if (!s)
     return 1;
-  const uint32_t cap = ds41_decoder_batch_capacity(d);
+  const uint32_t cap = ds41_decoder_batch_capacity(d.get());
+  std::vector<DecoderPtr> od;
+  std::vector<DsparkStatePtr> os;
+  od.reserve(kOthers);
+  os.reserve(kOthers);
+  for (uint32_t o = 0; o < kOthers; ++o) {
+    const uint32_t len = (uint32_t)prompt.size() - 3 * (o + 1);
+    DecoderPtr dd(ds41_decoder_create(engine, len + 16), &ds41_decoder_destroy);
+    DsparkStatePtr ss(dd ? ds41_dspark_state_create(engine, dd.get()) : nullptr,
+                      &ds41_dspark_state_destroy);
+    if (!ss) {
+      std::fprintf(stderr, "batched draft: session %u not created\n", o);
+      return 1;
+    }
+    od.push_back(std::move(dd));
+    os.push_back(std::move(ss));
+  }
+  const uint32_t feature_rows =
+      std::min<uint32_t>((uint32_t)prompt.size(), DS41_DSPARK_FEATURE_ROWS);
+  std::vector<float> host((std::size_t)feature_rows *
+                          DS41_DSPARK_TARGET_LAYERS * 5120);
+  std::vector<float> draft_logits((std::size_t)DS41_DSPARK_BLOCK *
+                                  logits.size());
+  std::vector<float> comparison_logits(draft_logits.size());
+  const int fit = FitStreamedExperts(engine, status, true);
+  if (fit != 0)
+    return fit;
   uint32_t pos0 = 0, rows = 0;
   const float* features = nullptr;
   for (uint32_t at = 0; at < prompt.size();) {
     const uint32_t n = std::min<uint32_t>(cap, (uint32_t)prompt.size() - at);
-    if (ds41_decoder_eval(d, prompt.data() + at, n, logits.data(), 1, nullptr,
-                          nullptr) != 0)
+    if (ds41_decoder_eval(d.get(), prompt.data() + at, n, logits.data(), 1,
+                          nullptr, nullptr) != 0)
       return 1;
-    features = ds41_decoder_features(d, &pos0, &rows);
+    features = ds41_decoder_features(d.get(), &pos0, &rows);
     /* The ring holds only the dumped rows, so the oracle sees the same keys. */
-    ds41_dspark_state_reset(s, pos0);
-    if (!ds41_dspark_inject(s, pos0, rows))
+    ds41_dspark_state_reset(s.get(), pos0);
+    if (!ds41_dspark_inject(s.get(), pos0, rows))
       return 1;
     at += n;
   }
   const int anchor = Argmax(logits.data(), logits.size());
   int32_t drafts[DS41_DSPARK_BLOCK];
-  if (!ds41_dspark_draft(s, anchor, drafts, DS41_DSPARK_BLOCK))
+  if (!ds41_dspark_draft(s.get(), anchor, drafts, DS41_DSPARK_BLOCK))
     return 1;
-  std::vector<float> host((std::size_t)rows * DS41_DSPARK_TARGET_LAYERS * 5120);
-  std::vector<float> draft_logits((std::size_t)DS41_DSPARK_BLOCK *
-                                  logits.size());
-  if (hipMemcpy(host.data(), features, host.size() * sizeof(float),
-                hipMemcpyDeviceToHost) != hipSuccess ||
+  if (hipMemcpy(
+          host.data(), features,
+          (std::size_t)rows * DS41_DSPARK_TARGET_LAYERS * 5120 * sizeof(float),
+          hipMemcpyDeviceToHost) != hipSuccess ||
       !ds41_dspark_copy_logits(engine, draft_logits.data()))
     return 1;
   const std::string base(dir);
-  std::ofstream(base + "/features.f32", std::ios::binary)
-      .write((const char*)host.data(), host.size() * 4);
-  std::ofstream(base + "/logits.f32", std::ios::binary)
-      .write((const char*)draft_logits.data(), draft_logits.size() * 4);
+  std::ofstream features_out(base + "/features.f32", std::ios::binary);
+  std::ofstream logits_out(base + "/logits.f32", std::ios::binary);
   std::ofstream meta(base + "/draft.txt");
+  if (!features_out || !logits_out || !meta)
+    return 1;
+  features_out.write((const char*)host.data(),
+                     (std::size_t)rows * DS41_DSPARK_TARGET_LAYERS * 5120 * 4);
+  logits_out.write((const char*)draft_logits.data(), draft_logits.size() * 4);
   meta << pos0 << " " << rows << " " << anchor;
   for (int32_t t : drafts)
     meta << " " << t;
   meta << "\n";
+  features_out.close();
+  logits_out.close();
+  meta.close();
+  if (!features_out || !logits_out || !meta)
+    return 1;
   std::printf("dumped %u feature rows from %u, anchor %d, drafts", rows, pos0,
               anchor);
   for (int32_t t : drafts)
@@ -575,11 +728,10 @@ int DsparkDump(ds41_engine* engine, const std::vector<int>& prompt,
   for (uint32_t width = 1; width < DS41_DSPARK_BLOCK; width++) {
     int32_t prefix[DS41_DSPARK_BLOCK];
     std::fill_n(prefix, DS41_DSPARK_BLOCK, -1);
-    if (!ds41_dspark_draft(s, anchor, prefix, width))
+    if (!ds41_dspark_draft(s.get(), anchor, prefix, width))
       return 1;
-    std::vector<float> prefix_logits(draft_logits.size());
-    if (!ds41_dspark_copy_logits(engine, prefix_logits.data()) ||
-        std::memcmp(prefix_logits.data(), draft_logits.data(),
+    if (!ds41_dspark_copy_logits(engine, comparison_logits.data()) ||
+        std::memcmp(comparison_logits.data(), draft_logits.data(),
                     (std::size_t)width * logits.size() * sizeof(float)) != 0) {
       std::fprintf(stderr, "draft head logits differ at width %u\n", width);
       return 1;
@@ -592,8 +744,8 @@ int DsparkDump(ds41_engine* engine, const std::vector<int>& prompt,
       }
     }
   }
-  if (ds41_dspark_draft(s, anchor, drafts, 0) ||
-      ds41_dspark_draft(s, anchor, drafts, DS41_DSPARK_BLOCK + 1))
+  if (ds41_dspark_draft(s.get(), anchor, drafts, 0) ||
+      ds41_dspark_draft(s.get(), anchor, drafts, DS41_DSPARK_BLOCK + 1))
     return 1;
   std::printf(
       "draft prefixes/logits 1..5 identical; output tails untouched; invalid "
@@ -602,40 +754,30 @@ int DsparkDump(ds41_engine* engine, const std::vector<int>& prompt,
   /* The same draft in batches: sessions over shorter prefixes of the prompt
    * draft with it, before and after it, and its drafts and head logits must
    * match its own draft's. */
-  constexpr uint32_t kOthers = 1;
   std::fprintf(stderr, "batched draft check\n");
-  std::vector<ds41_decoder*> od;
-  std::vector<ds41_dspark_state*> os;
   std::vector<int> anchors;
-  for (uint32_t o = 0; o < kOthers; o++) {
+  anchors.reserve(kOthers);
+  for (uint32_t o = 0; o < kOthers; ++o) {
     const uint32_t len = (uint32_t)prompt.size() - 3 * (o + 1);
-    ds41_decoder* dd = ds41_decoder_create(engine, len + 16);
-    ds41_dspark_state* ss = dd ? ds41_dspark_state_create(engine, dd) : nullptr;
-    if (!ss) {
-      std::fprintf(stderr, "batched draft: session %u not created\n", o);
-      return 1;
-    }
     for (uint32_t at = 0; at < len;) {
       const uint32_t n = std::min<uint32_t>(cap, len - at);
       uint32_t fp = 0, fr = 0;
-      const int rc = ds41_decoder_eval(dd, prompt.data() + at, n, logits.data(),
-                                       1, nullptr, nullptr);
-      if (rc != 0 || !ds41_decoder_features(dd, &fp, &fr)) {
+      const int rc = ds41_decoder_eval(od[o].get(), prompt.data() + at, n,
+                                       logits.data(), 1, nullptr, nullptr);
+      if (rc != 0 || !ds41_decoder_features(od[o].get(), &fp, &fr)) {
         std::fprintf(stderr,
                      "batched draft: session %u prefill failed (rc %d, at %u "
                      "of %u)\n",
                      o, rc, at, len);
         return 1;
       }
-      ds41_dspark_state_reset(ss, fp);
-      if (!ds41_dspark_inject(ss, fp, fr)) {
+      ds41_dspark_state_reset(os[o].get(), fp);
+      if (!ds41_dspark_inject(os[o].get(), fp, fr)) {
         std::fprintf(stderr, "batched draft: session %u inject failed\n", o);
         return 1;
       }
       at += n;
     }
-    od.push_back(dd);
-    os.push_back(ss);
     anchors.push_back(Argmax(logits.data(), logits.size()));
   }
   for (const bool last : {false, true}) {
@@ -646,10 +788,10 @@ int DsparkDump(ds41_engine* engine, const std::vector<int>& prompt,
       req[i].drafts = out[i];
       req[i].count = DS41_DSPARK_BLOCK;
       if (i == mine) {
-        req[i].state = s;
+        req[i].state = s.get();
         req[i].anchor = anchor;
       } else {
-        req[i].state = os[o];
+        req[i].state = os[o].get();
         req[i].anchor = anchors[o++];
       }
     }
@@ -657,19 +799,18 @@ int DsparkDump(ds41_engine* engine, const std::vector<int>& prompt,
       std::fprintf(stderr, "batched draft failed\n");
       return 1;
     }
-    std::vector<float> batch_logits(draft_logits.size());
-    if (!ds41_dspark_copy_logits(engine, batch_logits.data(),
+    if (!ds41_dspark_copy_logits(engine, comparison_logits.data(),
                                  mine * DS41_DSPARK_BLOCK, DS41_DSPARK_BLOCK)) {
       std::fprintf(stderr, "batched draft logits not copied\n");
       return 1;
     }
     for (uint32_t r = 0; r < DS41_DSPARK_BLOCK; r++) {
       const std::size_t v = logits.size();
-      if (std::memcmp(batch_logits.data() + r * v, draft_logits.data() + r * v,
-                      v * sizeof(float)) != 0) {
+      if (std::memcmp(comparison_logits.data() + r * v,
+                      draft_logits.data() + r * v, v * sizeof(float)) != 0) {
         float diff = 0.0f;
         for (std::size_t i = 0; i < v; i++)
-          diff = std::max(diff, std::fabs(batch_logits[r * v + i] -
+          diff = std::max(diff, std::fabs(comparison_logits[r * v + i] -
                                           draft_logits[r * v + i]));
         std::fprintf(stderr,
                      "batched draft (%s) head logits differ at row %u: max "
@@ -685,12 +826,6 @@ int DsparkDump(ds41_engine* engine, const std::vector<int>& prompt,
     }
   }
   std::printf("batched drafts (first and last of %u) identical\n", kOthers + 1);
-  for (ds41_dspark_state* ss : os)
-    ds41_dspark_state_destroy(ss);
-  for (ds41_decoder* dd : od)
-    ds41_decoder_destroy(dd);
-  ds41_dspark_state_destroy(s);
-  ds41_decoder_destroy(d);
   return 0;
 }
 
@@ -701,30 +836,41 @@ int DsparkDump(ds41_engine* engine, const std::vector<int>& prompt,
  * reference tokens' NLL under both, top-1 agreement and KL(full || replay)
  * per continuation position. */
 int ReplayProbe(ds41_engine* engine, const std::vector<int>& ids,
-                uint32_t context, uint32_t rows) {
-  if (rows < 2 || ids.size() <= rows + 1)
+                uint32_t context, uint32_t rows, ProbeStatus* status) {
+  if (rows < 2 || std::uint64_t{rows} + 2 > ids.size())
     return 2;
   const uint32_t prompt = (uint32_t)(ids.size() - rows);
-  ds41_decoder* d = ds41_decoder_create(
-      engine, std::max<uint32_t>(context, (uint32_t)ids.size() + 1));
+  DecoderPtr d(
+      ds41_decoder_create(
+          engine, std::max<uint32_t>(context, (uint32_t)ids.size() + 1)),
+      &ds41_decoder_destroy);
   if (!d)
     return 1;
   const std::size_t vocab = (std::size_t)ds41_engine_vocab_size(engine);
-  const uint32_t cap = ds41_decoder_batch_capacity(d);
+  if (vocab == 0 || rows > std::numeric_limits<std::size_t>::max() / vocab)
+    return 1;
+  const uint32_t cap = ds41_decoder_batch_capacity(d.get());
+  if (rows > cap)
+    return 2;
   std::vector<float> logits[2];
+  logits[0].resize((std::size_t)rows * vocab);
+  logits[1].resize((std::size_t)rows * vocab);
+  std::vector<float> last(vocab);
   double prefill_ms[2] = {};
+  const int fit = FitStreamedExperts(engine, status, true);
+  if (fit != 0)
+    return fit;
   for (int replay = 0; replay < 2; ++replay) {
-    if (ds41_decoder_reset(d) != 0)
+    if (ds41_decoder_reset(d.get()) != 0)
       return 1;
-    std::vector<float> last(vocab);
     const auto t0 = std::chrono::steady_clock::now();
     for (uint32_t i = 0; i < prompt;) {
       const uint32_t n = std::min(cap, prompt - i);
       const int rc = replay
-                         ? ds41_decoder_eval_prompt(d, ids.data() + i, n,
+                         ? ds41_decoder_eval_prompt(d.get(), ids.data() + i, n,
                                                     prompt, last.data(), 0)
-                         : ds41_decoder_eval(d, ids.data() + i, n, last.data(),
-                                             0, nullptr, nullptr);
+                         : ds41_decoder_eval(d.get(), ids.data() + i, n,
+                                             last.data(), 0, nullptr, nullptr);
       if (rc != 0) {
         std::fprintf(stderr, "prefill failed at %u\n", i);
         return 1;
@@ -736,22 +882,21 @@ int ReplayProbe(ds41_engine* engine, const std::vector<int>& ids,
                              .count();
     /* Row r predicts ids[prompt + r]: the batch is the prompt's last token
      * and the continuation but its last token. */
-    logits[replay].resize((std::size_t)rows * vocab);
-    if (ds41_decoder_reset(d) != 0)
+    if (ds41_decoder_reset(d.get()) != 0)
       return 1;
     /* Re-run the prompt without its last token, then the scored batch. */
     for (uint32_t i = 0; i + 1 < prompt;) {
       const uint32_t n = std::min(cap, prompt - 1 - i);
       const int rc = replay
-                         ? ds41_decoder_eval_prompt(d, ids.data() + i, n,
+                         ? ds41_decoder_eval_prompt(d.get(), ids.data() + i, n,
                                                     prompt - 1, last.data(), 0)
-                         : ds41_decoder_eval(d, ids.data() + i, n, last.data(),
-                                             0, nullptr, nullptr);
+                         : ds41_decoder_eval(d.get(), ids.data() + i, n,
+                                             last.data(), 0, nullptr, nullptr);
       if (rc != 0)
         return 1;
       i += n;
     }
-    if (ds41_decoder_eval(d, ids.data() + prompt - 1, rows,
+    if (ds41_decoder_eval(d.get(), ids.data() + prompt - 1, rows,
                           logits[replay].data(), rows, nullptr, nullptr) != 0)
       return 1;
   }
@@ -759,6 +904,8 @@ int ReplayProbe(ds41_engine* engine, const std::vector<int>& ids,
   uint32_t agree = 0, ref_hits[2] = {};
   for (uint32_t r = 0; r < rows; ++r) {
     const int target = ids[prompt + r];
+    if (target < 0 || (std::size_t)target >= vocab)
+      return 2;
     double lse[2];
     int best[2];
     for (int k = 0; k < 2; ++k) {
@@ -791,7 +938,6 @@ int ReplayProbe(ds41_engine* engine, const std::vector<int>& ids,
       "top-1 reference %u / %u; agreement %u; kl mean %.5f max %.4f\n",
       rows, nll[0] / rows, nll[1] / rows, ref_hits[0], ref_hits[1], agree,
       kl_sum / rows, kl_max);
-  ds41_decoder_destroy(d);
   return 0;
 }
 
@@ -892,7 +1038,7 @@ int RunProbe(int argc, char** argv, ProbeStatus& status) {
       break;
     }
   }
-  if (!model) {
+  if (!model || generate < 0) {
     std::fprintf(
         stderr,
         "usage: %s MODEL-00001-of-N.gguf [--upload] [--status-json FILE] "
@@ -911,18 +1057,21 @@ int RunProbe(int argc, char** argv, ProbeStatus& status) {
   Report("start");
   const auto begin = std::chrono::steady_clock::now();
   ds41_engine* engine = nullptr;
-  ds41_decoder* decoder = nullptr;
+  std::unique_ptr<ds41_engine, EngineCloser> engine_owner(
+      nullptr, EngineCloser{&status});
+  DecoderPtr decoder(nullptr, &ds41_decoder_destroy);
+  auto close = [&](int result) {
+    decoder.reset();
+    engine_owner.reset();
+    engine = nullptr;
+    Report("closed");
+    return result;
+  };
   auto transition = [&](Stage stage, std::uint64_t completed,
                         std::uint64_t total, const char* failure = nullptr) {
     const int result =
         status.stages.Transition(stage, completed, total, failure);
-    if (result != 0) {
-      ds41_decoder_destroy(decoder);
-      decoder = nullptr;
-      ds41_engine_close(engine);
-      engine = nullptr;
-    }
-    return result;
+    return result != 0 ? close(result) : result;
   };
   ds41_engine_options options{};
   options.model_path = model;
@@ -944,9 +1093,9 @@ int RunProbe(int argc, char** argv, ProbeStatus& status) {
     return result;
   if (ds41_engine_open(&engine, &options) != 0)
     return transition(Stage::kLoading, 0, 1, "engine_open_failed");
+  engine_owner.reset(engine);
   if (const int result = transition(Stage::kLoading, 1, 1); result != 0)
     return result;
-  status.expert_cache = ds41_engine_expert_cache_status(engine);
   const double seconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - begin)
           .count();
@@ -1005,7 +1154,7 @@ int RunProbe(int argc, char** argv, ProbeStatus& status) {
       if (*p == ',')
         ++p;
     }
-    return ReplayProbe(engine, ids, context, replay_check);
+    return close(ReplayProbe(engine, ids, context, replay_check, &status));
   }
   if (decode && (spec_check || spec_bench >= 0 || joint_check > 0 ||
                  dspark_generate > 0 || dspark_dump)) {
@@ -1018,15 +1167,16 @@ int RunProbe(int argc, char** argv, ProbeStatus& status) {
         ++p;
     }
     if (dspark_dump)
-      return DsparkDump(engine, prompt, dspark_dump);
+      return close(DsparkDump(engine, prompt, dspark_dump, &status));
     if (joint_check > 0)
-      return JointProbe(engine, prompt, context, joint_check, joint_cycles,
-                        std::max<uint32_t>(joint_rows, joint_check));
+      return close(
+          JointProbe(engine, prompt, context, joint_check, joint_cycles,
+                     std::max<uint32_t>(joint_rows, joint_check), &status));
     if (dspark_generate > 0)
-      return DsparkProbe(engine, prompt, context, dspark_generate,
-                         dspark_sweep);
-    return SpeculativeProbe(engine, prompt, context, spec_check, spec_bench,
-                            spec_width);
+      return close(DsparkProbe(engine, prompt, context, dspark_generate,
+                               dspark_sweep, &status));
+    return close(SpeculativeProbe(engine, prompt, context, spec_check,
+                                  spec_bench, spec_width, &status));
   }
   if (decode) {
     /* Feed comma-separated ids one at a time (--batch: in decoder batches),
@@ -1043,38 +1193,53 @@ int RunProbe(int argc, char** argv, ProbeStatus& status) {
     if (const int result = transition(Stage::kPrefill, 0, tokens.size());
         result != 0)
       return result;
-    decoder = ds41_decoder_create(engine, std::max(context, total + 1));
+    decoder =
+        DecoderPtr(ds41_decoder_create(engine, std::max(context, total + 1)),
+                   &ds41_decoder_destroy);
     if (!decoder)
       return transition(Stage::kPrefill, 0, tokens.size(),
                         "decoder_create_failed");
     Report("decoder");
-    Dump dump;
-    if (out_dir) {
-      dump.dir = out_dir;
-      dump.routes = std::fopen((dump.dir + "/routes.txt").c_str(), "w");
+    const size_t vocab = (size_t)ds41_engine_vocab_size(engine);
+    for (int token : tokens) {
+      if (token < 0 || (size_t)token >= vocab)
+        return transition(Stage::kPrefill, 0, tokens.size(),
+                          "token_out_of_range");
     }
+    Dump dump;
+    dump.dir = out_dir ? out_dir : "";
+    const bool want_dump = out_dir && !score;
+    const bool want_score = out_dir && score;
+    FilePtr routes_file(
+        want_dump
+            ? std::fopen((std::string(out_dir) + "/routes.txt").c_str(), "w")
+            : nullptr);
     /* --score writes the argmax and next-token NLL per prompt position instead
      * of logits. */
-    FILE* logits_file =
-        out_dir && !score ? std::fopen((dump.dir + "/logits.f32").c_str(), "wb")
-                          : nullptr;
-    FILE* score_file = out_dir && score
+    FilePtr logits_file(
+        want_dump ? std::fopen((dump.dir + "/logits.f32").c_str(), "wb")
+                  : nullptr);
+    FilePtr score_file(want_score
                            ? std::fopen((dump.dir + "/score.txt").c_str(), "w")
-                           : nullptr;
-    const size_t vocab = (size_t)ds41_engine_vocab_size(engine);
+                           : nullptr);
+    if ((want_dump && (!routes_file || !logits_file)) ||
+        (want_score && !score_file))
+      return transition(Stage::kPrefill, 0, tokens.size(),
+                        "output_open_failed");
+    dump.routes = routes_file.get();
     std::vector<float> logits(vocab);
     std::vector<int> generated;
-    const uint32_t cap = ds41_decoder_batch_capacity(decoder);
+    generated.reserve(static_cast<std::size_t>(generate) + 1);
+    const uint32_t cap = ds41_decoder_batch_capacity(decoder.get());
     std::vector<float> rows(batch ? static_cast<size_t>(cap) * vocab : 0);
-    // The decoder and probe buffers exist before the source cache-fit step.
-    if (stream_experts && ds41_engine_fit_experts(engine, 0) != 0)
-      return transition(Stage::kPrefill, 0, tokens.size(),
-                        "expert_cache_fit_failed");
-    status.expert_cache = ds41_engine_expert_cache_status(engine);
+    // The decoder and probe buffers exist before the shared cache-fit step.
+    const int fit = FitStreamedExperts(engine, &status, false);
+    if (fit != 0)
+      return close(fit);
     /* Records the logits of position `step` (input `token`). */
     auto consume = [&](uint32_t step, int token, const float* row, double ms) {
       if (logits_file)
-        std::fwrite(row, sizeof(float), vocab, logits_file);
+        std::fwrite(row, sizeof(float), vocab, logits_file.get());
       int best = 0;
       for (size_t i = 1; i < vocab; ++i)
         if (row[i] > row[(size_t)best])
@@ -1088,7 +1253,7 @@ int RunProbe(int argc, char** argv, ProbeStatus& status) {
         const double nll =
             std::log(sum) -
             ((double)row[(size_t)tokens[step + 1]] - (double)row[(size_t)best]);
-        std::fprintf(score_file, "%u %d %d %.6f %.2f\n", step, best,
+        std::fprintf(score_file.get(), "%u %d %d %.6f %.2f\n", step, best,
                      tokens[step + 1], nll, ms);
       } else if (!score_file) {
         std::printf("step %u token %d -> %d (%.1f ms)\n", step, token, best,
@@ -1104,8 +1269,8 @@ int RunProbe(int argc, char** argv, ProbeStatus& status) {
         const auto t0 = std::chrono::steady_clock::now();
         /* Every row's logits only when they are recorded. */
         const uint32_t logit_rows = logits_file || score_file ? n : 1;
-        if (ds41_decoder_eval(decoder, tokens.data() + step, n, rows.data(),
-                              logit_rows, nullptr, nullptr) != 0) {
+        if (ds41_decoder_eval(decoder.get(), tokens.data() + step, n,
+                              rows.data(), logit_rows, nullptr, nullptr) != 0) {
           std::fprintf(stderr, "batch failed at step %u\n", step);
           return transition(Stage::kPrefill, step, tokens.size(),
                             "prefill_failed");
@@ -1135,7 +1300,7 @@ int RunProbe(int argc, char** argv, ProbeStatus& status) {
       const int token = step < tokens.size() ? tokens[step] : generated.back();
       dump.pos = step;
       const auto t0 = std::chrono::steady_clock::now();
-      if (ds41_decoder_step(decoder, token, logits.data(),
+      if (ds41_decoder_step(decoder.get(), token, logits.data(),
                             out_dir && !score ? DumpLayer : nullptr,
                             &dump) != 0) {
         std::fprintf(stderr, "decode failed at step %u\n", step);
@@ -1159,19 +1324,11 @@ int RunProbe(int argc, char** argv, ProbeStatus& status) {
          ++i)
       std::printf(" %d", generated[i]);
     std::printf("\n");
-    if (logits_file)
-      std::fclose(logits_file);
-    if (score_file)
-      std::fclose(score_file);
-    if (dump.routes)
-      std::fclose(dump.routes);
     Report("evaluated");
-    ds41_decoder_destroy(decoder);
   }
   status.expert_cache = ds41_engine_expert_cache_status(engine);
-  ds41_engine_close(engine);
-  Report("closed");
-  return 0;
+  status.expert_cache_read = true;
+  return close(0);
 }
 
 int main(int argc, char** argv) {

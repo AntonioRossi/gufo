@@ -5,7 +5,7 @@
 #include <utility>
 #include <vector>
 
-#include "src/families/qwen/text/chat_template.hpp"
+#include "gufo/ext/families/qwen/text/chat_template.hpp"
 
 namespace gufo::models {
 
@@ -97,13 +97,6 @@ std::vector<tokenization::TokenId> QwenGenerator::Generate(
   }
 
   return output_tokens;
-}
-
-std::string QwenGenerator::GenerateText(std::string_view prompt,
-                                        const GenerationOptions& options) {
-  const auto prompt_tokens = tokenizer_->Encode(prompt);
-  const auto generated_tokens = Generate(prompt_tokens, options);
-  return tokenizer_->Decode(generated_tokens);
 }
 
 }  // namespace gufo::models

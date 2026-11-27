@@ -18,14 +18,22 @@ Reference protocols:
 ## Implementation
 
 The C++20 runtime serves bounded HTTP/1.1 requests with one connection worker
-per request and a separate inference scheduler. Connections close after each
-response. Request heads are parsed in Rust by httparse as RFC 9112 defines
+per connection and a separate inference scheduler. The CLI keeps HTTP/1.1
+connections open for sequential requests, bounded by 5 seconds of idle time and
+100 requests; HTTP/1.0 requests and `Connection: close` close after the
+response, and embedded callers retain close-per-response by default. A
+connection waiting for its next request does not count toward
+`--max-connections`: at the limit the server closes the one idle longest to
+admit a new client. A stream that ends without its final chunk closes its
+connection. Request
+heads are parsed in Rust by httparse as RFC 9112 defines
 them: a token method, single spaces in the request line, an origin-form target
 without control bytes in UTF-8, HTTP/1.0 or HTTP/1.1, and header fields without
 control bytes. A bare LF ends a line, and one empty line before the request line
-is ignored. Other heads, `Transfer-Encoding` (chunked bodies are not
-implemented), and `Content-Length` values that are not decimal digits or
-disagree get 400; more than 100 header fields, llama-server's limit too, get
+is ignored. Chunked bodies are decoded by hyper and held to the request size
+limit while they are read (413 past it). Other heads, transfer codings other
+than `chunked`, `Content-Length` beside `Transfer-Encoding`, and
+`Content-Length` values that are not decimal digits or disagree get 400; more than 100 header fields, llama-server's limit too, get
 431. Multipart form bodies, which the ASR, image-edit and video APIs take, are
 parsed in Rust as RFC 7578 defines them: a `boundary` of 1 to 70 RFC 2046
 characters, the last one not a space; parameters as RFC 9110 writes them
@@ -142,7 +150,8 @@ privacy-safe scheduler and stage metrics used by
 `tools/serving/gufo-serving-bench.py`: queue, prefill, decode, TTFT and ITL timing;
 actual prefill work; cache use; logical concurrency; physical execution width;
 and the executed plan. Prompts, generated text, local paths, request IDs, and
-token IDs are excluded.
+token IDs are excluded. `tools/serving/gufo-interface-bench.py` reads the same
+metrics to separate connection, framing and token-arrival cost from generation.
 
 DeepSeek V4 Flash batches up to eight active requests. Each request owns its
 attention caches, compressor state, position, and sampling state. Dense and
@@ -183,7 +192,9 @@ cost.
 Each model chooses its prefill chunk. Every text runner declares a scheduling
 profile: beside decoders, the host keeps the profile's pass width and splits
 each pass by layers, with a decode round between groups (one group runs it
-unsplit). A lone request keeps the model's own pass width. `--prefill-chunk`
+unsplit). A lone request keeps the profile's pass width while another session
+is free, so a request arriving during it waits for one such pass, and the
+model's own, possibly wider, pass when every session is taken. `--prefill-chunk`
 is deprecated: it is accepted, ignored with a `event=deprecated_option`
 warning, and will be removed at the next breaking release.
 
@@ -487,7 +498,7 @@ cache snapshots. HTTP handlers do not implement model kernels.
 | `POST` | `/v1/completions` | Optional legacy text completion adapter |
 | `GET` | `/health` | Process liveness and GPU context (aliases: `/v1/health`, `/healthz`, `/`) |
 | `GET` | `/ready` | Model and backend readiness (aliases: `/v1/ready`, `/readyz`) |
-| `GET` | `/metrics` | Prometheus-format operational metrics (text LLM serving only) |
+| `GET` | `/metrics` | Prometheus-format operational metrics (text LLM and embedding serving) |
 
 ### Other model services
 
@@ -640,9 +651,12 @@ and supports `json`, `text`, and `verbose_json`. `stream=true` with JSON emits
 OpenAI transcript delta/done events. Long uploads are split within model
 capacity; `max_tokens` applies per chunk. Timestamp (`timestamp_granularities[]`)
 and logprobs (`include[]`) requests are rejected; unknown fields are ignored.
-A `file` the model cannot decode returns 400 `invalid_audio_input` (an
-`invalid_audio_input` error event when streaming); other failures return 500
-`transcription_failed`.
+Serve decodes the `file` (WAV, FLAC, MP3, Ogg Vorbis or Opus, WebM Vorbis or
+Opus; up to 8 channels, 192 kHz and 30 minutes) and passes every provider
+16 kHz mono PCM, so extensions take the same formats as Qwen3-ASR. A `file`
+that cannot be decoded returns 400 `invalid_audio_input` before the provider
+runs; a provider that rejects its audio does too (an `invalid_audio_input`
+error event when streaming). Other failures return 500 `transcription_failed`.
 
 `GET /v1/realtime?intent=transcription` upgrades to OpenAI's manual-commit
 transcription WebSocket interface. [ASR streaming examples](../models/qwen3-asr.md#streaming-a-file)
@@ -658,7 +672,26 @@ turns (`input_audio_buffer.speech_started`/`speech_stopped`, then the
 commit). Without `intent`, models that hear and speak hold an OpenAI Realtime
 conversation on the same path: audio and text input, streamed text and 24 kHz
 speech replies, function tools, `response.cancel`, interruption by user
-speech and `conversation.item.truncate`. The handshake selects the
+speech and `conversation.item.truncate`. With
+`audio.input.transcription` (whose `model`, when present, is the served model
+ID or one of its aliases), the served model transcribes each committed audio
+buffer before any reply, sending
+`conversation.item.input_audio_transcription.delta` and `.completed`, or
+`.failed`; a reply waits for its transcript. Spoken `conversation.item.create`
+messages are not transcribed. `output_modalities` with both `"audio"` and
+`"text"` speaks, as `["audio"]` does. A named `audio.output.voice` must be one
+the conversation lists (`VoiceConversation::voices()`), and
+`conversation.item.delete` removes any system message item, or the latest
+item when it is a user message that nothing followed and the conversation
+implements `DeleteUserTurn`; other requests get an error event. System
+message items (`role: "system"`, `input_text` parts) join the session's
+instructions in order until deleted; while the user speaks they apply once
+the turn closes. `response.create` takes `metadata` (echoed in
+`response.created` and `response.done`) and, when the conversation supports
+response options, `instructions` for that reply, `tool_choice` `none` or
+`tools: []` (the session's tools may be repeated), and `conversation: "none"`
+with an empty `input` for an out-of-band reply that leaves the conversation
+unchanged. `tool_choice` `none` also applies to a session. The handshake selects the
 `realtime` subprotocol a client offers. `GET /voice`, served when the model
 holds conversations, is a browser client for it. Event-level behavior is
 documented by the model's provider (for example the LFM3-Audio extension).
@@ -726,7 +759,7 @@ processing defaults; `null` counts as omitted.
 | `cfg_scale` | Forwarded as given (A1111 clients send 7), 0 to 100. Omitted uses the model default (1, unguided, for Qwen-Image-2.1 and Turbo, so a negative prompt alone has no effect) |
 | `steps` | 2 to 100; omitted uses the checkpoint default (40; Turbo accepts only 8) |
 | `seed` | Integer; negative or omitted is random. Batch images use consecutive seeds |
-| `width`, `height` | Positive; multiples of 32, at most 4096 per side and 4 megapixels. `txt2img` default 1024 × 1024 |
+| `width`, `height` | Positive; multiples of 32, at most 4096 per side and 4.5 megapixels. `txt2img` default 1024 × 1024 |
 | `batch_size` | Image count, 1 to 10 (default 1). `n_iter` is ignored |
 | `lora` | Adapter list; see below |
 | `init_images` | `img2img` only, required: the first entry, as base64 or a base64 data URL; URLs are not fetched |
@@ -894,7 +927,8 @@ resolved by these endpoints.
 `top_logprobs`, and the shared
 sampling controls. Message content supports
 `input_text` and `input_image` with an `image_url` (HTTPS or a data URL).
-Image uploads accept PNG, JPEG and WebP. Base64 data URLs also accept
+Image uploads accept PNG, JPEG and WebP. JPEG excludes arithmetic coding,
+lossless JPEG and DNL markers, which are rejected with 400. Base64 data URLs also accept
 `image/jpg`, mixed-case media types/`base64`, and parameters such as `name=`.
 Clients supply the complete conversation, including prior Gufo `output` items
 when retaining reasoning. Replay `function_call` items with their `call_id`,
@@ -1386,8 +1420,10 @@ waits for `/ready` to return HTTP 200 before forwarding the triggering
 request. Gufo returns 503 while the model loads. The served model name
 matches the llama-swap model ID, so clients can request `gufo-model`
 through the proxy. Gufo requires no credentials on any route, so llama-swap's
-default `/health` probe works too. For long cold starts, increase llama-swap's
-`healthCheckTimeout` to cover model and disk-cache loading.
+default `/health` probe works too. While `gufo serve llm` loads, its 503 body
+reports the load stage, which llama-swap v269 and later show; each new stage
+restarts the `healthCheckTimeout` countdown. Set `healthCheckTimeout` to cover
+the longest stage, usually loading the weights or walking the disk cache.
 
 Gufo answers the names passed to `--served-model-name` plus its built-in
 identifiers: TTS also accepts `qwen3-tts`, ASR also accepts `qwen3-asr` and
@@ -1473,9 +1509,17 @@ recorded device state without performing GPU work on each poll. HTTP model repla
 conversations are not implemented.
 
 While `gufo serve llm` loads its model and walks the disk cache tier, the port
-already answers every request, `/health` included, with 503
-`{"error":{"message":"Loading model","type":"unavailable_error","code":"loading"}}`
-and `Retry-After: 1`, as llama-server does. A refused connection therefore
+already answers every request, `/health` included, with 503 and
+`Retry-After: 1`, as llama-server does. The body carries llama-server's error
+object plus the load stage as top-level `progress` (0 to 1) and `message`:
+
+```json
+{"error":{"message":"Loading model","type":"unavailable_error","code":"loading"},"progress":0.05,"message":"Loading weights"}
+```
+
+The stages are `Opening model` (0), `Loading weights` (0.05) and
+`Preparing sessions and cache` (0.9), which includes the disk-tier walk.
+`progress` marks the stage, not a share of the remaining time. A refused connection therefore
 means the process is not running; supervisors such as llama-swap, which treat
 only a 200 health check as ready, keep waiting until the model is loaded. If
 the address cannot be bound early, the port stays closed until the load ends.
@@ -1567,12 +1611,78 @@ a restart is the only recovery.
 
 ## Metrics
 
+`/metrics` renders a registry that lives in Rust (`src/core/metrics`, wrapped
+for C++ by `src/core/metrics.hpp`) in the Prometheus text format. A process
+serves one model class, and `HttpServer` answers `GET /metrics` and
+`GET /v1/metrics` from that class's registry. `MetricsEndpoint` in
+`http_server.cpp` picks the registry once, from the text backend, then the
+embedding service. A server with neither of them, such as the ASR, TTS, image,
+video and decision servers, answers 404.
+
+The text server registers its families once, in `TextMetrics`
+(`src/cli/serve/generation_metrics.hpp`), and the scheduler and request paths
+update them through typed handles. An embedding server never constructs
+`TextMetrics`, so no `llamacpp:*` family appears there. An update neither locks
+nor allocates. A text scrape sets the process-global gauges and renders them
+under one mutex, so concurrent scrapes do not interleave.
+
+Families render in registration order, and `GET /metrics` answers with
+`Content-Type: text/plain; version=0.0.4`. Integer samples print as integers.
+Fractional samples print with 17 significant digits, as a C++ stream set to
+`max_digits10` does, so 0.1 reads `0.10000000000000001`. A non-finite sample
+reads `NaN`, `+Inf` or `-Inf`. A histogram has fixed upper bounds chosen at
+registration and renders as cumulative `_bucket{le="..."}` lines with `_sum`
+and `_count`. Its bounds and sum print in the shortest form that reads back
+exactly, so `le="0.1"` stays `0.1`. A histogram counts a non-finite observation
+in its `+Inf` bucket and in `_count` but leaves it out of `_sum`.
+`gufo_device_lost_total` counts confirmed GPU context losses.
+`tests/fixtures/metrics/text_server.golden` pins the text server's body byte
+for byte.
+
+The embedding service owns its own registry, built in
+`EmbeddingMetrics` (`src/cli/serve/embedding_metrics.hpp`) when the service is
+constructed, and records at `EmbeddingService::EmbedInputs`, so HTTP requests
+and extension callers count alike. The counters cover calls that reach the
+service. The readiness and device-lost gates (503) in `HttpServer` and the
+handler's 400 rejections of a malformed request body run before the service,
+so those answers count nowhere. A call counts once, as `ok`, `invalid`, `error`,
+`cancelled` or `device_lost`. `invalid` covers the 400-class statuses
+`kInputTooLong`, `kInvalidInput`, `kInvalidAudioInput` and
+`kInvalidVideoInput`. `error` covers `kFailed`, including a call to a service
+that is not ready.
+
+The service decides whether a result is usable before it ends the call, so the
+status matches the HTTP answer. After the runner reports `kOk` the service
+still returns `kCancelled` when the caller's cancellation check is true, and
+`kFailed` when the batch does not hold one non-empty finite embedding and one
+token count per input or when a requested `dimensions` prefix has no usable
+norm. Tokens count only for calls that end `ok`.
+
+| Family | Type | Meaning |
+|---|---|---|
+| `gufo_embedding_requests_total{status}` | counter | Requests by outcome (`ok`, `error`, `invalid`, `cancelled`, `device_lost`). |
+| `gufo_embedding_inputs_total{modality}` | counter | Input parts received by the service before the runner runs, by `text`, `image`, `audio` or `video`. Parts of a request that is then rejected still count. |
+| `gufo_embedding_input_tokens_total` | counter | Tokens embedded by successful requests, after truncation. |
+| `gufo_embedding_request_seconds` | histogram | Time from admission to the end of a request, in buckets from 5 ms to 30 s. |
+| `gufo_embedding_requests_in_flight` | gauge | Requests admitted and not yet finished. |
+| `gufo_device_lost_total` | counter | Confirmed GPU context losses, incremented when the service first reports a lost device. |
+
+Batching happens inside the extension's runner, so the service has no device
+batch to time and exports no per-batch histogram.
+
 `/metrics` exposes total prompt/generated tokens and the latest prompt/decode
 speeds. The token counters advance as each prefill chunk and generated token
 executes, so their rates show live throughput; prompt tokens exclude cache
 hits. `llamacpp:requests_processing` counts admitted requests, including cache
 preparation and cleanup; `llamacpp:requests_deferred` counts requests waiting
 for a session. The speed gauges retain the latest nonzero request rates.
+`gufo_request_queue_seconds` and `gufo_time_to_first_token_seconds`
+are histograms with buckets from 1 ms to 1,200 s. Both start at `request_start`,
+set when the HTTP handler hands the request to the backend. The scheduler
+observes queue time once at admission by a session, including cache preparation
+(state wait and cache restore), which is the `queue_ms` value in the request
+log, and time to first token at the first generated token. Requests that end
+before admission or before a token are not observed.
 When the scheduler finishes or cancels a request, whether or not the client
 reads the result, it adds the request's cached prompt tokens
 (`llamacpp:prompt_tokens_cached_total`), prefill and decode seconds
@@ -1588,6 +1698,15 @@ even if the client disconnects before reading it; requests that fail in the
 scheduler, such as on a deadline or a runner error, add none of these.
 `llamacpp:kv_cache_usage_ratio` is the in-flight prompt and generated tokens
 over sessions times context; retained cache entries are not counted.
+Each scrape sets `llamacpp:kv_cache_usage_ratio` and the shared-state and
+prompt-state gauges from the backend. `gufo_shared_state_bytes`,
+`gufo_shared_state_charged_bytes`, `gufo_shared_state_reclaimable_bytes` and
+`gufo_shared_state_max_prompt_tokens` report the demand-mapped state the
+sessions share, and `gufo_shared_state_waits_total`,
+`gufo_shared_state_pauses_total` and `gufo_shared_state_preemptions_total`
+count requests that waited, decoding requests that paused, and requests
+stopped with `memory_pressure`. These families are absent from the text for
+backends that do not share session state.
 `gufo_prompt_state_budget_bytes` is the host RAM prompt state may claim before
 admission refuses, `gufo_prompt_state_reserved_bytes` the bytes charged to
 in-flight requests, and `gufo_prompt_state_available_bytes` the remainder.
@@ -1747,7 +1866,11 @@ Each request to `/v1/chat/completions`, `/v1/completions`, `/v1/responses`,
   miss detail the completion log also reports, `generated_tokens`, `finish`,
   `error` when generation failed, the `prompt` decoded from its tokens with
   special tokens spelled out, and the raw `output` before reasoning and
-  tool-call parsing.
+  tool-call parsing. The parser's inputs follow: the model's `tool_dialect`,
+  its `reasoning` markup (`open` and `close`), the chat's
+  `initial_output_state` and `pieces`, the end offset in bytes of each piece
+  the parser read. `tools/generation_parse/corpus.py` turns a trace into
+  cases for `generation_parse_test`, without the prompts.
 - `response`: `status`, `outcome`, whether the reply was a `stream`, and the
   `body` the client received. For a stream this is the event stream as
   written, `: ping` keepalives included, so a difference between streaming and
@@ -1793,7 +1916,12 @@ Loading logs report elapsed time, model, context and session capacity,
 speculative mode and memory. `rss_mib` is process resident memory;
 `host_available_mib` is available system memory. At load completion,
 `gpu_device_used_mib` is device-wide HIP usage. These overlap on unified memory
-and must not be added together.
+and must not be added together. A failed load adds `gpu_device_free_mib` and
+`gpu_device_total_mib`, read after the partial upload is freed, and on Linux
+`gtt_used_mib` and `gtt_total_mib`. On Linux the free value counts GPU memory
+held by other processes, which `host_available_mib` can miss: a small free value
+with plenty of host memory available means another GPU process holds the
+memory. On Windows it counts only this process's allocations.
 With disk caching enabled, `phase=artifact_identity` identifies full-file
 SHA-256 work. Digests are cached against the open file's identity, size and
 modification/change timestamps; unchanged artifacts avoid another scan.
@@ -1815,6 +1943,8 @@ lazily in the worker. Control characters are escaped in log lines.
   including that `--log-level` and `-v` change the emitted log rather than only
   parsing.
 - `openai_chat_test`: chat parsing, streaming, images, tools and sampling controls.
+- `chat_request_test`: the Rust request decoder for Chat Completions, Responses
+  and Messages through its C++ caller: expected requests, rejections and calls.
 - Per-model serving tests: greedy/sampled decoding, batching, cache reuse and
   cancellation. Use the affected model's benchmark README for commands and limits.
 

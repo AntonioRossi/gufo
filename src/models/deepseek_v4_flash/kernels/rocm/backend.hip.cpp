@@ -9,17 +9,6 @@
  * dense Q8 prefill kernels; see mmq/VENDOR.md. */
 #include "mmq/ds4_mmq.h"
 
-/* MMQ can reuse a producer-emitted Q8_1 activation instead of quantizing its
- * own. This backend keeps no such registry, so MMQ always takes its regular
- * activation-quantize prelude. */
-extern "C" int ds4_hip_q8_fold_take_q81(
-        const void *src, uint64_t in_dim, const void **q81) {
-    (void)src;
-    (void)in_dim;
-    if (q81) *q81 = NULL;
-    return 0;
-}
-
 #define FULL_WARP_MASK 0xFFFFFFFFFFFFFFFFULL
 #define MASK_T uint64_t
 #define DS4_GPU_BACKEND_NAME "ROCm"
@@ -60,7 +49,7 @@ struct ds4_gpu_tensor {
     void *ptr;
     uint64_t bytes;
     int owner;
-    /* Demand-mapped rows (ds4_gpu_tensor_alloc_rows): a heap-held
+    /* Demand-mapped rows (ds4_gpu_tensor_from_state): a heap-held
      * std::shared_ptr<gufo::mem::Region>; null otherwise. */
     void *region;
     uint64_t row_bytes;

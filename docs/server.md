@@ -83,13 +83,17 @@ itself:
 | Token budget | `reasoning_budget_tokens` | `reasoning_budget_tokens` | `thinking.budget_tokens` |
 
 Effort is one of `minimal`, `low`, `medium`, `high`, `xhigh` and `max`; it is an
-instruction to the model, not a limit. The budget forces the end of reasoning
+instruction to the model, not a limit. Some models can't switch thinking off
+(Inkling 2 Mini): for them, thinking off selects the lowest effort, and a short
+thought may still come back. The budget forces the end of reasoning
 after that many tokens; `--reasoning-budget` sets the server default.
 
 Reasoning comes back separately from the answer: as `reasoning_content` in
 Chat Completions, `reasoning` items in Responses and `thinking` blocks in
 Messages. Keep the effort the same across a conversation: it's part of the
-prompt, so changing it means processing the whole conversation again.
+prompt, so changing it means processing the whole conversation again. Models
+that think again after part of an answer return the thoughts and the answer
+text in order ([Inkling 2 Mini](models/inkling-2-mini.md#thinking)).
 
 ## Tools and structured output
 
@@ -112,7 +116,8 @@ cut the JSON short.
 Vision models accept images as `image_url` parts in Chat Completions,
 `input_image` in Responses and `image` blocks in Messages, also inside tool
 results. Send PNG, JPEG or WebP as a data URL or a public HTTPS URL; Gufo
-refuses private and loopback addresses.
+refuses private and loopback addresses. Arithmetic-coded and lossless JPEG
+files are rejected; see [image inputs](internal/server.md).
 
 All images in a request share 20 MiB of encoded data and 15 seconds of
 downloading, and each can have up to 32 megapixels. There's no fixed number of
@@ -189,9 +194,21 @@ a hung GPU, which fails nothing, into the same exit.
 
 `/metrics` exports llama-server's Prometheus counters: tokens processed and
 generated, cached prompt tokens, speeds, queue depth and speculative
-acceptance. `/slots` shows what each session is doing, `/props` which model,
-build and settings are running, and `POST /apply-template` the prompt a chat
-request becomes. [Troubleshooting](troubleshooting.md) covers the logs.
+acceptance. `gufo_request_queue_seconds` and
+`gufo_time_to_first_token_seconds` are histograms that start when the HTTP
+handler hands the request to the backend. Queue time stops when a session
+admits the request, after state wait and cache restore, and equals `queue_ms`
+in the request log. Time to first token stops at the first generated token.
+Requests that end before admission or before a token are not observed, and
+buckets run from 1 ms to 1,200 s. `/slots` shows what each session is doing,
+`/props` which model, build and settings are running, and
+`POST /apply-template` the prompt a chat request becomes.
+[Troubleshooting](troubleshooting.md) covers the logs.
+
+`gufo serve embedding` also answers `/metrics`, with `gufo_embedding_*`
+families instead of the llama-server ones: requests by outcome, input parts by
+modality, tokens embedded, request latency and requests in flight. Requests
+rejected as too long or malformed by the service count as `invalid`.
 
 ## llama-swap
 
@@ -223,3 +240,10 @@ because loading and reading the disk cache take a while.
 Gufo never logs prompts or replies, and never runs tool calls, commands or
 generated code. Only the opt-in [`--trace`](troubleshooting.md#content-trace)
 file records content.
+
+Gufo keeps HTTP/1.1 connections open for sequential requests, so a reverse
+proxy can reuse upstream connections. An HTTP/1.0 request or `Connection: close`
+closes the connection after its response. An idle connection closes after 5
+seconds, after 100 requests, or earlier when a new client needs its slot, so a
+pooled client should retry a request that fails on a reused connection before
+any response arrives.

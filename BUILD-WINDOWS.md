@@ -39,7 +39,11 @@ release packaging builds the upstream runtime instead.
 - **Visual Studio 2022 or 18** with the "Desktop development with C++"
   workload (MSVC x64).
 - **Git**, **CMake ≥ 3.29**, **Ninja** (Visual Studio bundles both;
-  `vs-env.cmd` puts them on `PATH`) and **Python 3**.
+  `vs-env.cmd` puts them on `PATH`) and **Python 3**. The
+  [Loom runtime](docs/models/loom.md#platforms), which the build compiles
+  from source, needs **CMake ≥ 4.2**, newer than Visual Studio's; put a
+  standalone CMake first on `PATH`, or leave Loom out with
+  `-DGUFO_EXTENSIONS=<list>`.
 - **Rust 1.88 or newer** from [rustup](https://rustup.rs), with the
   `x86_64-pc-windows-msvc` target. Rustup reads the pinned version from
   `rust-toolchain.toml`; Cargo builds the Rust components.
@@ -51,22 +55,23 @@ release packaging builds the upstream runtime instead.
   setx VCPKG_ROOT C:\vcpkg
   ```
 
-- **TheRock 10.0.0 for gfx1151**, `therock-dist-windows-gfx1151-10.0.0.tar.gz`
-  (sha256 `1293927b06b3b8d4bd7e0265823fb998bc9e0d83c68f33dcfa5d32663b30ce38`),
+- **TheRock 10.1.0 for gfx1151**, AMD's
+  [`therock-dist-windows-gfx1151-10.1.0.tar.gz`](https://stable.repo.amd.com/rocm/core/tarball/therock-dist-windows-gfx1151-10.1.0.tar.gz)
+  (sha256 `42698635d66eee273fd0ef580b68494aa2363a4fa6cf733db7806438863a8136`),
   extracted anywhere, with `HIP_PATH` set to that directory:
 
   ```cmd
   mkdir C:\TheRock\build
-  tar -xzf therock-dist-windows-gfx1151-10.0.0.tar.gz -C C:\TheRock\build
+  tar -xzf therock-dist-windows-gfx1151-10.1.0.tar.gz -C C:\TheRock\build
   setx HIP_PATH C:\TheRock\build
   ```
 
-  AMD's index no longer serves 10.0.0; CI downloads it from the
-  [Windows port's mirror](https://github.com/endyjasmi/gufo/releases/tag/toolchain/therock-10.0.0).
-  It is the only SDK validated at full speed on gfx1151: later builds
-  (10.1.0 through at least the 10.2.0a nightlies of October 2026) compile
-  correct kernels that stall on this GPU, with decode up to hundreds of times
-  slower. The `windows-base` preset chain-loads
+  It is the ROCm release the Linux build uses, and the only SDK that CI builds
+  and validates on Windows. From clang 24 (ROCm 10.1), `clang-cl` no longer
+  passes its optimisation level to the device compile, so HIP sources that set
+  no level of their own would build device code at `-O0` and decode up to
+  hundreds of times slower; the build adds `/clang:-O3` for both compiles.
+  The `windows-base` preset chain-loads
   `cmake/toolchains/windows-therock.cmake`, which takes `clang-cl` and the
   runtime from `HIP_PATH`. `clang-cl` ignores GCC-style options such as
   `-ffast-math`, `-ffp-contract=off` or `-fno-slp-vectorize`, with only a
@@ -163,7 +168,7 @@ tools\windows\vs-env.cmd cmake --preset windows-release -DCMAKE_POLICY_DEFAULT_C
 build\windows-release\gufo.exe diagnose
 ```
 
-On a Strix Halo it reports `x86_64-windows`, the gfx1151 GPU and ROCm 10.0.0.
+On a Strix Halo it reports `x86_64-windows`, the gfx1151 GPU and ROCm 10.1.0.
 Then run a real model (a GGUF from Hugging Face, for example an unsloth
 UD-Q4_K_XL build):
 
@@ -214,6 +219,15 @@ EmbeddingGemma 2, Qwen3-ASR, Qwen3-TTS and Qwen3.8-27B.
   configure could not find the XRT SDK's `xclbinutil.exe`.
 - After reinstalling or upgrading the SDK, rerun the patch in step 2 and
   rebuild into a fresh build directory so the runtime stages again.
+- TheRock's Windows `rocblas.dll` carries none of rocBLAS's own GPU kernels,
+  only the Tensile libraries in `rocblas\`. From ROCm 10.1, rocBLAS runs an
+  in-place GEMM (C == D) with one output row or column through its GEMV
+  kernel on gfx11, which then fails with `hipErrorInvalidKernelFile`
+  (status 6) and leaves the HIP context unusable. Beta-zero GEMMs pass
+  `BetaZeroGemmC` (`include/gufo/ext/experimental/rocblas_gemm.hpp`) as C,
+  which keeps them on Tensile with the bits TheRock 10.0 produced. hipBLAS
+  runs every GEMM in place, so a call that can have one output row or column
+  uses rocBLAS directly.
 
 ## NPU device test (developers)
 
